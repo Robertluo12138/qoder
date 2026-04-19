@@ -20,7 +20,7 @@ The architecture is intentionally strict:
 
 The documented primary entry point is the Qoder project command:
 
-- [.qoder/commands/self-supervisor.md](/Users/robert/Desktop/qoder/.qoder/commands/self-supervisor.md)
+- [.qoder/commands/self-supervisor.md](.qoder/commands/self-supervisor.md)
 
 In a Qoder session opened at the repository root, use the project
 command `self-supervisor` and provide the natural-language task you want
@@ -30,7 +30,7 @@ handled. The command is the deterministic entry point for real runs.
 
 The companion project skill is still available:
 
-- [.qoder/skills/self-supervisor-v1/SKILL.md](/Users/robert/Desktop/qoder/.qoder/skills/self-supervisor-v1/SKILL.md)
+- [.qoder/skills/self-supervisor-v1/SKILL.md](.qoder/skills/self-supervisor-v1/SKILL.md)
 
 Use the skill as reusable project knowledge. Prefer the project command
 when you want predictable, repeatable execution.
@@ -114,7 +114,7 @@ python3 scripts/run_tests.py
 ```
 
 You can choose the validation depth through presets in
-[supervisor_config.json](/Users/robert/Desktop/qoder/supervisor_config.json)
+[supervisor_config.json](supervisor_config.json)
 or with `python3 scripts/run_tests.py --preset <name>`.
 
 Built-in presets:
@@ -182,7 +182,7 @@ Interpretation:
 
 ## Qoder Invocation Wrapper
 
-[scripts/qoder_invoke.py](/Users/robert/Desktop/qoder/scripts/qoder_invoke.py)
+[scripts/qoder_invoke.py](scripts/qoder_invoke.py)
 is the reusable wrapper around `qodercli`.
 
 It provides:
@@ -310,7 +310,7 @@ Useful flags:
 
 ## What The Orchestrator Does
 
-[scripts/run_self_supervisor_qoder.py](/Users/robert/Desktop/qoder/scripts/run_self_supervisor_qoder.py)
+[scripts/run_self_supervisor_qoder.py](scripts/run_self_supervisor_qoder.py)
 performs:
 
 1. preflight
@@ -356,11 +356,11 @@ With `--strict`, warnings become blocking.
 
 Machine-readable report:
 
-- [artifacts/delivery_report.json](/Users/robert/Desktop/qoder/artifacts/delivery_report.json)
+- `artifacts/delivery_report.json`
 
 Human-readable acceptance checklist:
 
-- [artifacts/user_acceptance.md](/Users/robert/Desktop/qoder/artifacts/user_acceptance.md)
+- `artifacts/user_acceptance.md`
 
 The acceptance file is designed to answer:
 
@@ -374,7 +374,7 @@ The acceptance file is designed to answer:
 
 ## Cleanup And Predictable Reruns
 
-[scripts/clean_state.py](/Users/robert/Desktop/qoder/scripts/clean_state.py)
+[scripts/clean_state.py](scripts/clean_state.py)
 clears stale run state while preserving the latest delivery report and
 acceptance checklist by default.
 

@@ -7,6 +7,7 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+node_modules/
 
 # Self-supervisor
 # Keep `artifacts/` as a directory marker but exclude generated outputs.
@@ -15,13 +16,8 @@ artifacts/*
 # Per-run state is scratch; never commit.
 .qoder/state/
 
+# Local tool state
+.claude/
+
 # OS
 .DS_Store
-
-# appended by scripts/preflight.py --fix
-.venv
-.qoder/state
-.pytest_cache
-.mypy_cache
-.ruff_cache
-node_modules/

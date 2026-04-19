@@ -51,6 +51,7 @@ when you want predictable, repeatable execution.
 ├── scripts/
 │   ├── bootstrap_mac.sh
 │   ├── clean_state.py
+│   ├── prepare_isolated_run.py
 │   ├── preflight.py
 │   ├── qoder_invoke.py
 │   ├── rollback.py
@@ -112,23 +113,38 @@ Every stage uses the same test entry point:
 python3 scripts/run_tests.py
 ```
 
-You can strengthen it in [supervisor_config.json](/Users/robert/Desktop/qoder/supervisor_config.json).
+You can choose the validation depth through presets in
+[supervisor_config.json](/Users/robert/Desktop/qoder/supervisor_config.json)
+or with `python3 scripts/run_tests.py --preset <name>`.
 
-Default:
+Built-in presets:
 
-```json
-"test_command": "python -m pytest -q"
+- `pytest`
+- `ruff_pytest`
+- `mypy_pytest`
+- `ruff_mypy_pytest`
+
+Examples:
+
+```bash
+python3 scripts/run_tests.py --list-presets
+python3 scripts/run_tests.py --preset pytest
+python3 scripts/run_tests.py --preset ruff_pytest
+python3 scripts/run_tests.py --preset mypy_pytest
+python3 scripts/run_tests.py --preset ruff_mypy_pytest
 ```
 
-Extended example:
+Default config:
 
 ```json
-"test_command": [
-  "bash",
-  "-lc",
-  "ruff check . && mypy . && python -m pytest -q"
-]
+"test_preset": "pytest"
 ```
+
+Recommended progression:
+
+- start with `pytest` for fast iteration
+- move to `ruff_pytest` or `mypy_pytest` when the repo is ready
+- use `ruff_mypy_pytest` for the strictest repeated-use workflow
 
 ## Write-Stage Safety Model
 
@@ -207,6 +223,47 @@ After the run:
 python3 scripts/verify_delivery.py --json --strict
 ```
 
+## Optional Cleaner Git Context
+
+For repeated real-project usage, prefer running from an isolated git
+context.
+
+Recommended order:
+
+1. worktree
+2. isolated branch in the current checkout
+3. main checkout only when the repo is already clean
+
+Preview a worktree setup:
+
+```bash
+python3 scripts/prepare_isolated_run.py --mode worktree --json
+```
+
+Create a worktree:
+
+```bash
+python3 scripts/prepare_isolated_run.py --mode worktree --apply
+```
+
+Preview an isolated branch:
+
+```bash
+python3 scripts/prepare_isolated_run.py --mode branch --json
+```
+
+Create an isolated branch in the current checkout:
+
+```bash
+python3 scripts/prepare_isolated_run.py --mode branch --apply
+```
+
+Recommended usage:
+
+- use worktree mode for the cleanest repeated unattended runs
+- use branch mode when you want to stay in the same directory
+- run `python3 scripts/clean_state.py` after entering the new context
+
 ## Recommended Rerun After Changes
 
 Use this when you want a fresh, predictable rerun while preserving the
@@ -265,6 +322,11 @@ performs:
 7. deterministic audit
 8. seal into `artifacts/delivery_report.json`
 
+The sealed report also includes:
+
+- git context metadata, including branch and worktree detection
+- unattended auto-write recommendation guardrails
+
 ## Verifying And Sealing
 
 ```bash
@@ -302,11 +364,13 @@ Human-readable acceptance checklist:
 
 The acceptance file is designed to answer:
 
+- what the request was in short form
 - what changed
-- what tests passed
-- which files to inspect
-- which commands to run manually
+- which files changed
+- what automated validation passed
+- what manual validation to run
 - which risks still remain
+- how to roll back safely
 
 ## Cleanup And Predictable Reruns
 
@@ -335,6 +399,25 @@ When to use it:
 - after an interrupted run that left stale `.qoder/state/` files behind
 - before demos when you want the new report to be obviously current
 
+## Task-Size Guardrails
+
+The workflow now records whether a task is recommended for unattended
+auto-write.
+
+The report considers:
+
+- request size
+- planned task count
+- changed file count
+- broad request markers such as `entire repo` or `large refactor`
+
+If a run crosses those thresholds, the sealed report marks it as:
+
+- `not_recommended_for_unattended_auto_write`
+
+This does not change the Qoder-native execution path, but it does make
+the risk visible in the report and acceptance checklist.
+
 ## Minimal Realistic Demo Task
 
 This is a good small task for a real first demo:
@@ -362,6 +445,7 @@ Healthy signals:
 
 - Qoder capability probes pass in preflight
 - the write stage reports restricted tools and a real Qoder invocation
+- the unattended auto-write guardrail remains recommended for small tasks
 - `delivery_status` is `sealed`
 - strict verify returns `ready_for_acceptance`
 

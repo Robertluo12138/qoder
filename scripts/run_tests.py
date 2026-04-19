@@ -47,6 +47,18 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 
+DEFAULT_TEST_PRESETS: Dict[str, List[str]] = {
+    "pytest": ["python", "-m", "pytest", "-q"],
+    "ruff_pytest": ["bash", "-lc", "ruff check . && python -m pytest -q"],
+    "mypy_pytest": ["bash", "-lc", "mypy . && python -m pytest -q"],
+    "ruff_mypy_pytest": [
+        "bash",
+        "-lc",
+        "ruff check . && mypy . && python -m pytest -q",
+    ],
+}
+
+
 def repo_root_from_script() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -61,17 +73,45 @@ def load_config(root: Path) -> Dict[str, Any]:
         return {}
 
 
-def resolve_command(cfg: Dict[str, Any]) -> List[str]:
-    """Return the argv for the test command."""
+def normalize_command(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(x) for x in value]
+    if isinstance(value, str):
+        return shlex.split(value)
+    raise ValueError("command value must be a string or list")
+
+
+def load_test_presets(cfg: Dict[str, Any]) -> Dict[str, List[str]]:
+    presets = {name: cmd[:] for name, cmd in DEFAULT_TEST_PRESETS.items()}
+    configured = cfg.get("test_presets")
+    if not isinstance(configured, dict):
+        return presets
+    for name, value in configured.items():
+        try:
+            presets[str(name)] = normalize_command(value)
+        except ValueError:
+            continue
+    return presets
+
+
+def resolve_command(cfg: Dict[str, Any], preset_override: str | None = None) -> tuple[List[str], str | None]:
+    """Return the argv for the test command plus the selected preset name."""
+    presets = load_test_presets(cfg)
+    selected_preset = preset_override or cfg.get("test_preset")
+    if selected_preset:
+        name = str(selected_preset)
+        if name not in presets:
+            raise ValueError(f"unknown test preset: {name}")
+        return presets[name], name
+
     default = ["python", "-m", "pytest", "-q"]
     cmd = cfg.get("test_command")
     if not cmd:
-        return default
-    if isinstance(cmd, list):
-        return [str(x) for x in cmd]
-    if isinstance(cmd, str):
-        return shlex.split(cmd)
-    return default
+        return default, None
+    try:
+        return normalize_command(cmd), None
+    except ValueError:
+        return default, None
 
 
 def prefer_venv_python(root: Path, cmd: List[str], prefer: bool) -> List[str]:
@@ -165,11 +205,47 @@ def main(argv: List[str]) -> int:
         default=None,
         help="override test command (single shell-quoted string)",
     )
+    parser.add_argument(
+        "--preset",
+        default=None,
+        help="select a configured test preset",
+    )
+    parser.add_argument(
+        "--list-presets",
+        action="store_true",
+        help="print available test presets as JSON and exit",
+    )
     args = parser.parse_args(argv)
 
     root = repo_root_from_script()
     cfg = load_config(root)
-    cmd = shlex.split(args.command) if args.command else resolve_command(cfg)
+    presets = load_test_presets(cfg)
+    if args.list_presets:
+        print(json.dumps({"presets": presets, "selected": cfg.get("test_preset")}, indent=2))
+        return 0
+
+    if args.command:
+        cmd = shlex.split(args.command)
+        selected_preset = None
+    else:
+        try:
+            cmd, selected_preset = resolve_command(cfg, args.preset)
+        except ValueError as exc:
+            payload = {
+                "schema_version": 1,
+                "command": [],
+                "preset": args.preset,
+                "status": "error",
+                "passed": False,
+                "exit_code": 2,
+                "returncode": 2,
+                "stdout": "",
+                "stderr": str(exc),
+                "duration_s": 0.0,
+                "timed_out": False,
+            }
+            print(json.dumps(payload, indent=2))
+            return 1
     cmd = prefer_venv_python(root, cmd, bool(cfg.get("prefer_repo_venv", False)))
 
     result = run(cmd, root, args.timeout)
@@ -178,6 +254,7 @@ def main(argv: List[str]) -> int:
     payload: Dict[str, Any] = {
         "schema_version": 1,
         "command": cmd,
+        "preset": selected_preset,
         "status": status,
         "passed": status in ("ok", "ok_no_tests"),
         "exit_code": result["exit_code"],

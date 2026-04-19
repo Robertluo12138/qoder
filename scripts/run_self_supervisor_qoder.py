@@ -44,6 +44,17 @@ WRITE_PERMISSION_HINTS = (
     "yolo",
     "dangerously-skip-permissions",
 )
+DEFAULT_BROAD_TASK_MARKERS = (
+    "entire repo",
+    "whole repo",
+    "across the codebase",
+    "across the repository",
+    "large refactor",
+    "full migration",
+    "rewrite the project",
+    "rewrite the codebase",
+    "all files",
+)
 
 
 def utc_now() -> str:
@@ -188,6 +199,83 @@ def git_head_sha() -> str | None:
     if code == 0 and out.strip():
         return out.strip()
     return None
+
+
+def git_path_info() -> Dict[str, Any]:
+    branch = git_branch_name()
+    commit_sha = git_head_sha()
+    code_git_dir, out_git_dir, _ = run_git(["rev-parse", "--git-dir"])
+    code_common_dir, out_common_dir, _ = run_git(["rev-parse", "--git-common-dir"])
+    code_top, out_top, _ = run_git(["rev-parse", "--show-toplevel"])
+
+    git_dir = out_git_dir.strip() if code_git_dir == 0 else None
+    common_dir = out_common_dir.strip() if code_common_dir == 0 else None
+    top_level = out_top.strip() if code_top == 0 else None
+    return {
+        "branch": branch,
+        "commit_sha": commit_sha,
+        "repo_root": str(REPO_ROOT),
+        "git_dir": git_dir,
+        "git_common_dir": common_dir,
+        "git_top_level": top_level,
+        "is_worktree": bool(git_dir and common_dir and git_dir != common_dir),
+    }
+
+
+def assess_auto_write_guardrail(
+    request: str,
+    plan: Dict[str, Any] | None,
+    review: Dict[str, Any] | None,
+    config: Dict[str, Any],
+) -> Dict[str, Any]:
+    request_chars = len(request)
+    planned_tasks = len((plan or {}).get("tasks") or [])
+    changed_files = len((review or {}).get("changed") or [])
+
+    max_request_chars = int(config.get("guardrail_max_request_chars", 1200))
+    max_planned_tasks = int(config.get("guardrail_max_planned_tasks", 3))
+    max_changed_files = int(config.get("guardrail_max_changed_files", 8))
+    markers = [str(item).lower() for item in (config.get("guardrail_broad_request_markers") or DEFAULT_BROAD_TASK_MARKERS)]
+
+    request_lower = request.lower()
+    broad_hits = [marker for marker in markers if marker in request_lower]
+    reasons: List[str] = []
+
+    if request_chars > max_request_chars:
+        reasons.append(
+            f"request length {request_chars} exceeds recommended unattended limit {max_request_chars}"
+        )
+    if planned_tasks > max_planned_tasks:
+        reasons.append(
+            f"planned task count {planned_tasks} exceeds recommended unattended limit {max_planned_tasks}"
+        )
+    if review is not None and changed_files > max_changed_files:
+        reasons.append(
+            f"changed file count {changed_files} exceeds recommended unattended limit {max_changed_files}"
+        )
+    if broad_hits:
+        reasons.append(
+            "request appears broad for unattended auto-write: " + ", ".join(broad_hits)
+        )
+
+    status = (
+        "not_recommended_for_unattended_auto_write"
+        if reasons
+        else "recommended_for_unattended_auto_write"
+    )
+    return {
+        "status": status,
+        "request_chars": request_chars,
+        "planned_tasks": planned_tasks,
+        "changed_files": changed_files,
+        "broad_markers_found": broad_hits,
+        "reasons": reasons,
+        "thresholds": {
+            "max_request_chars": max_request_chars,
+            "max_planned_tasks": max_planned_tasks,
+            "max_changed_files": max_changed_files,
+        },
+    }
 
 
 def _is_ignored(path: str, patterns: List[str]) -> bool:
@@ -786,6 +874,8 @@ def assemble_report(
     reviewer: Dict[str, Any] | None,
     audit_report: Dict[str, Any] | None,
     checkpoint: Dict[str, Any] | None,
+    git_context: Dict[str, Any],
+    auto_write_guardrail: Dict[str, Any],
     delivery_status: str,
     stage_status: Dict[str, str],
     total_duration_s: float,
@@ -798,6 +888,7 @@ def assemble_report(
         "user_request": request,
         "config_used": {
             "project_type": config.get("project_type"),
+            "test_preset": config.get("test_preset"),
             "test_command": config.get("test_command"),
             "allowed_write_roots": config.get("allowed_write_roots"),
             "allow_dirty_repo": config.get("allow_dirty_repo"),
@@ -811,7 +902,13 @@ def assemble_report(
             "qoder_write_yolo_fallback_on_permission_error": config.get(
                 "qoder_write_yolo_fallback_on_permission_error"
             ),
+            "guardrail_max_request_chars": config.get("guardrail_max_request_chars"),
+            "guardrail_max_planned_tasks": config.get("guardrail_max_planned_tasks"),
+            "guardrail_max_changed_files": config.get("guardrail_max_changed_files"),
+            "guardrail_broad_request_markers": config.get("guardrail_broad_request_markers"),
         },
+        "git_context": git_context,
+        "auto_write_guardrail": auto_write_guardrail,
         "stages": {
             "preflight": preflight,
             "plan": plan,
@@ -862,6 +959,7 @@ def main(argv: List[str]) -> int:
     ensure_dirs()
     started = time.monotonic()
     stage_status: Dict[str, str] = {}
+    git_context = git_path_info()
 
     preflight = run_preflight()
     stage_status["preflight"] = "ok" if preflight.get("ready") else ("warn" if args.force else "blocked")
@@ -877,6 +975,8 @@ def main(argv: List[str]) -> int:
             reviewer=None,
             audit_report=None,
             checkpoint=None,
+            git_context=git_context,
+            auto_write_guardrail=assess_auto_write_guardrail(request, None, None, config),
             delivery_status="blocked_preflight",
             stage_status=stage_status,
             total_duration_s=round(time.monotonic() - started, 3),
@@ -912,6 +1012,8 @@ def main(argv: List[str]) -> int:
             reviewer=None,
             audit_report=None,
             checkpoint=checkpoint,
+            git_context=git_context,
+            auto_write_guardrail=assess_auto_write_guardrail(request, None, None, config),
             delivery_status="blocked_plan",
             stage_status=stage_status,
             total_duration_s=round(time.monotonic() - started, 3),
@@ -952,6 +1054,7 @@ def main(argv: List[str]) -> int:
 
     audit_report = audit(write, tests, review, reviewer if reviewer.get("ok") else {})
     stage_status["audit"] = "ok" if audit_report.get("all_passed") else "blocked"
+    auto_write_guardrail = assess_auto_write_guardrail(request, plan, review, config)
 
     delivery_status = "sealed" if audit_report.get("all_passed") else "blocked"
     report = assemble_report(
@@ -965,6 +1068,8 @@ def main(argv: List[str]) -> int:
         reviewer=reviewer,
         audit_report=audit_report,
         checkpoint=checkpoint,
+        git_context=git_context,
+        auto_write_guardrail=auto_write_guardrail,
         delivery_status=delivery_status,
         stage_status=stage_status,
         total_duration_s=round(time.monotonic() - started, 3),
@@ -976,6 +1081,7 @@ def main(argv: List[str]) -> int:
     else:
         print(f"[orchestrator] delivery_status={delivery_status}")
         print(f"[orchestrator] execution_mode={write.get('execution_mode')}")
+        print(f"[orchestrator] auto_write_guardrail={auto_write_guardrail.get('status')}")
         print(f"[orchestrator] report: {DELIVERY_REPORT}")
         print("[orchestrator] next: python scripts/verify_delivery.py --json --strict")
 

@@ -92,6 +92,14 @@ def writer_summaries(report: Dict[str, Any]) -> List[str]:
     return summaries
 
 
+def request_summary(report: Dict[str, Any]) -> str:
+    request = (report.get("user_request") or "").strip()
+    if not request:
+        return "(none)"
+    first_line = request.splitlines()[0].strip()
+    return first_line or request
+
+
 def manual_validation_commands(changed: List[str]) -> List[str]:
     commands = [
         "python3 scripts/run_tests.py",
@@ -103,6 +111,16 @@ def manual_validation_commands(changed: List[str]) -> List[str]:
         commands.append(f"git status --short -- {quoted}")
         commands.append(f"git diff --stat -- {quoted}")
     return commands
+
+
+def manual_validation_steps(report: Dict[str, Any], changed: List[str]) -> List[str]:
+    steps = ["Inspect the changed files listed below."]
+    if changed:
+        quoted = ", ".join(changed)
+        steps.append(f"Compare the resulting file set against the requested scope: {quoted}.")
+    for command in manual_validation_commands(changed):
+        steps.append(f"Run `{command}`.")
+    return steps
 
 
 def remaining_risks(report: Dict[str, Any], issues: List[str], warnings: List[str]) -> List[str]:
@@ -125,9 +143,27 @@ def remaining_risks(report: Dict[str, Any], issues: List[str], warnings: List[st
         if suggestion not in risks:
             risks.append(suggestion)
 
+    guardrail = report.get("auto_write_guardrail") or {}
+    if guardrail.get("status") == "not_recommended_for_unattended_auto_write":
+        for reason in guardrail.get("reasons", []) or []:
+            if reason not in risks:
+                risks.append(reason)
+
     if not risks:
         risks.append("No known remaining risks beyond normal manual review.")
     return risks
+
+
+def rollback_guidance(report: Dict[str, Any]) -> List[str]:
+    lines = [
+        "Review `.qoder/state/checkpoint.json` before reverting anything.",
+        "Use `python3 scripts/rollback.py --help` to inspect the supported rollback path.",
+        "Prefer reverting or abandoning the isolated branch/worktree rather than manually undoing many files.",
+    ]
+    git_context = report.get("git_context") or {}
+    if git_context.get("is_worktree"):
+        lines.append("This run was executed from a git worktree; if you discard the run, remove the worktree after review.")
+    return lines
 
 
 def build_acceptance_md(
@@ -142,10 +178,15 @@ def build_acceptance_md(
     tests = (report.get("stages") or {}).get("tests") or {}
     reviewer = (report.get("stages") or {}).get("reviewer") or {}
     audit = (report.get("stages") or {}).get("audit") or {}
+    write = (report.get("stages") or {}).get("write") or {}
     changed = review.get("changed", []) or []
     summaries = writer_summaries(report)
     commands = manual_validation_commands(changed)
+    steps = manual_validation_steps(report, changed)
     risks = remaining_risks(report, issues, warnings)
+    rollback = rollback_guidance(report)
+    git_context = report.get("git_context") or {}
+    guardrail = report.get("auto_write_guardrail") or {}
 
     lines: List[str] = []
     lines.append("# User Acceptance — Qoder Self-Supervisor Delivery")
@@ -155,10 +196,14 @@ def build_acceptance_md(
     lines.append(f"- verification_status: **{final_status}**")
     lines.append(f"- report: `artifacts/delivery_report.json`")
     lines.append("")
-    lines.append("## Request")
+    lines.append("## Request Summary")
     lines.append("")
-    request = (report.get("user_request") or "").strip().replace("\n", "\n> ")
-    lines.append("> " + (request or "(none)"))
+    lines.append(f"- summary: {request_summary(report)}")
+    if git_context:
+        lines.append(f"- branch: `{git_context.get('branch', 'unknown')}`")
+        lines.append(f"- git context: `{'worktree' if git_context.get('is_worktree') else 'branch_or_main_checkout'}`")
+    if guardrail:
+        lines.append(f"- unattended auto-write: `{guardrail.get('status', 'unknown')}`")
     lines.append("")
     lines.append("## What Changed")
     lines.append("")
@@ -179,8 +224,16 @@ def build_acceptance_md(
     else:
         lines.append("- (none)")
     lines.append("")
-    lines.append("## Tests That Passed")
+    lines.append("## Automated Validation Summary")
     lines.append("")
+    lines.append(
+        f"- write execution: `{write.get('execution_mode', 'unknown')}` via `{write.get('executor', 'unknown')}`"
+    )
+    if "successful_non_yolo_invocations" in write or "successful_yolo_invocations" in write:
+        lines.append(
+            f"- write attempts: non-yolo={write.get('successful_non_yolo_invocations', 0)}, "
+            f"yolo={write.get('successful_yolo_invocations', 0)}"
+        )
     lines.append(
         f"- sealed run: `{' '.join(tests.get('command', [])) or 'python3 scripts/run_tests.py'}` -> "
         f"`{tests.get('status', 'unknown')}` (exit {tests.get('exit_code', '?')})"
@@ -189,22 +242,17 @@ def build_acceptance_md(
         f"- rerun: `{' '.join(rerun.get('command', [])) or 'python3 scripts/run_tests.py'}` -> "
         f"`{rerun.get('status', 'unknown')}` (exit {rerun.get('exit_code', '?')})"
     )
-    lines.append("")
-    lines.append("## Review Decision")
-    lines.append("")
     lines.append(f"- decision: `{reviewer.get('decision', 'unknown')}`")
     if reviewer.get("summary"):
         lines.append(f"- summary: {reviewer.get('summary')}")
-    for issue in reviewer.get("blocking_issues", []) or []:
-        lines.append(f"- blocking: {issue}")
-    for item in reviewer.get("non_blocking_suggestions", []) or []:
-        lines.append(f"- suggestion: {item}")
-    lines.append("")
-    lines.append("## Audit")
-    lines.append("")
     lines.append(f"- final_decision: `{audit.get('final_decision', 'unknown')}`")
     for check in audit.get("checks", []) or []:
         lines.append(f"- {check.get('name')}: {'pass' if check.get('passed') else 'fail'}")
+    lines.append("")
+    lines.append("## Manual Validation Steps")
+    lines.append("")
+    for step in steps:
+        lines.append(f"- {step}")
     lines.append("")
     lines.append("## Manual Validation Commands")
     lines.append("")
@@ -215,6 +263,11 @@ def build_acceptance_md(
     lines.append("")
     for risk in risks:
         lines.append(f"- {risk}")
+    lines.append("")
+    lines.append("## Rollback Guidance")
+    lines.append("")
+    for item in rollback:
+        lines.append(f"- {item}")
     lines.append("")
     lines.append("## Acceptance Decision")
     lines.append("")
@@ -293,7 +346,12 @@ def main(argv: List[str]) -> int:
         "final_status": final_status,
         "issues": issues,
         "warnings": warnings,
+        "request_summary": request_summary(report),
+        "auto_write_guardrail": (report.get("auto_write_guardrail") or {}).get("status") if report else None,
+        "git_context": report.get("git_context") if report else None,
         "remaining_risks": remaining_risks(report, issues, warnings),
+        "rollback_guidance": rollback_guidance(report),
+        "manual_validation_steps": manual_validation_steps(report, changed),
         "manual_validation_commands": manual_validation_commands(changed),
         "rerun_tests": rerun,
         "delivery_report_exists": bool(report),

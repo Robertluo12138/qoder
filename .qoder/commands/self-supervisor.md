@@ -12,11 +12,12 @@ the repository-local, Qoder-native self-supervisor.
 When invoked, do the following in the current project:
 
 1. Save the user request to `artifacts/current_request.md`.
-2. If you want a fresh rerun, optionally run `python3 scripts/clean_state.py`.
-3. Run `python3 scripts/preflight.py --fix --json`.
-4. Run `python3 scripts/run_self_supervisor_qoder.py --request-file artifacts/current_request.md`.
-5. Run `python3 scripts/verify_delivery.py --json --strict`.
-6. Summarize:
+2. If you want a clean git context first, optionally run `python3 scripts/prepare_isolated_run.py --mode worktree --json` or `--mode branch --json`.
+3. If you want a fresh rerun, optionally run `python3 scripts/clean_state.py`.
+4. Run `python3 scripts/preflight.py --fix --json`.
+5. Run `python3 scripts/run_self_supervisor_qoder.py --request-file artifacts/current_request.md`.
+6. Run `python3 scripts/verify_delivery.py --json --strict`.
+7. Summarize:
    - the plan
    - changed files
    - test result

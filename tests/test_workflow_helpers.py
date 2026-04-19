@@ -67,11 +67,25 @@ def test_run_tests_json_includes_returncode_alias() -> None:
     assert payload["returncode"] == payload["exit_code"] == 0
 
 
+def test_run_tests_resolves_configured_preset() -> None:
+    run_tests = load_module("qoder_run_tests_module", "scripts/run_tests.py")
+    cmd, preset = run_tests.resolve_command({"test_preset": "ruff_pytest"})
+    assert preset == "ruff_pytest"
+    assert cmd[0] == "bash"
+    assert "ruff check ." in cmd[-1]
+
+
 def test_manual_validation_commands_include_git_status_for_changed_files() -> None:
     verify = load_module("qoder_verify_module", "scripts/verify_delivery.py")
     commands = verify.manual_validation_commands(["docs/example.md"])
     assert "python3 scripts/run_tests.py" in commands
     assert any(cmd.startswith("git status --short -- ") for cmd in commands)
+
+
+def test_request_summary_uses_first_line() -> None:
+    verify = load_module("qoder_verify_module", "scripts/verify_delivery.py")
+    summary = verify.request_summary({"user_request": "First line\nSecond line"})
+    assert summary == "First line"
 
 
 def test_remaining_risks_mentions_dirty_checkpoint() -> None:
@@ -85,6 +99,26 @@ def test_remaining_risks_mentions_dirty_checkpoint() -> None:
         [],
     )
     assert any("dirty worktree" in risk for risk in risks)
+
+
+def test_guardrail_marks_broad_request_not_recommended() -> None:
+    orchestrator = load_module("qoder_orchestrator_module", "scripts/run_self_supervisor_qoder.py")
+    assessment = orchestrator.assess_auto_write_guardrail(
+        "Do a large refactor across the codebase and touch all files.",
+        {"tasks": [{"id": "task-1"}]},
+        {"changed": ["a.py"]},
+        {},
+    )
+    assert assessment["status"] == "not_recommended_for_unattended_auto_write"
+    assert assessment["reasons"]
+
+
+def test_prepare_isolated_run_builds_worktree_plan() -> None:
+    helper = load_module("qoder_prepare_isolated_run_module", "scripts/prepare_isolated_run.py")
+    plan = helper.build_plan("worktree", "qoder/test-branch", "HEAD", None)
+    assert plan["mode"] == "worktree"
+    assert "git" in plan["commands"][0][0]
+    assert "worktree" in plan["commands"][0]
 
 
 def test_clean_state_default_candidates_include_transient_artifacts(tmp_path) -> None:

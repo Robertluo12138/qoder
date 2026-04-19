@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Self-supervisor
+# Keep `artifacts/` as a directory marker but exclude generated outputs.
+artifacts/*
+!artifacts/.gitkeep
+# Per-run state is scratch; never commit.
+.qoder/state/
+
+# OS
+.DS_Store
+
+# appended by scripts/preflight.py --fix
+.venv
+.qoder/state
+.pytest_cache
+.mypy_cache
+.ruff_cache
+node_modules/

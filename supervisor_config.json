@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "project_type": "python",
+  "test_command": "python -m pytest -q",
+  "ignore_paths": [
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    ".venv",
+    "venv",
+    "artifacts",
+    ".qoder/state",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "node_modules",
+    ".DS_Store"
+  ],
+  "allow_dirty_repo": false,
+  "prefer_repo_venv": true,
+  "allowed_write_roots": [
+    "scripts",
+    "src",
+    "tests",
+    "artifacts",
+    ".qoder",
+    "docs"
+  ],
+  "qoder_cli": "qoder",
+  "qoder_exec_template": null,
+  "single_task_threshold_chars": 200
+}

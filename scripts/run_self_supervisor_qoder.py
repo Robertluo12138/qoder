@@ -1,31 +1,5 @@
 #!/usr/bin/env python3
-"""Qoder self-supervisor orchestrator.
-
-Given a natural-language request, this script drives the full workflow:
-
-    preflight -> plan -> write -> test -> review -> audit -> seal
-
-and emits ``artifacts/delivery_report.json``. The companion script
-``verify_delivery.py`` then produces ``artifacts/user_acceptance.md``.
-
-Design principles
------------------
-
-* **Deterministic and conservative.** The audit uses concrete checks
-  (test exit code, file diff, scope intersection), never model judgment.
-* **Observable.** Every stage writes a status, and the final report
-  embeds the raw stage outputs.
-* **Graceful degradation.** When the ``qoder`` CLI is missing or no
-  ``qoder_exec_template`` is configured, the workflow still produces a
-  valid, verifiable delivery: task cards are written, tests still run,
-  and the report is sealed as ``sealed_advisory`` so verify can surface
-  the partial nature of the run.
-
-Entry point
------------
-
-    python scripts/run_self_supervisor_qoder.py --request "<prompt>"
-"""
+"""Qoder-native self-supervisor orchestrator."""
 
 from __future__ import annotations
 
@@ -36,89 +10,371 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Tuple
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from qoder_invoke import invoke_qoder_json  # noqa: E402
+
+
 ARTIFACTS = REPO_ROOT / "artifacts"
 STATE = REPO_ROOT / ".qoder" / "state"
 TASKS_DIR = STATE / "tasks"
-DELIVERY_REPORT = ARTIFACTS / "delivery_report.json"
 PLAN_PATH = STATE / "plan.json"
-
-# Directories we never descend into when snapshotting the filesystem,
-# regardless of user-configured ignore patterns. ``.git`` has its own
-# objects that change unpredictably and are not relevant to the diff.
+CHECKPOINT_PATH = STATE / "checkpoint.json"
+DELIVERY_REPORT = ARTIFACTS / "delivery_report.json"
 ALWAYS_SKIP_DIRS = {".git"}
+WRITE_PERMISSION_HINTS = (
+    "permission",
+    "approve",
+    "approval",
+    "confirm",
+    "confirmation",
+    "interactive",
+    "non-interactive",
+    "non interactive",
+    "yolo",
+    "dangerously-skip-permissions",
+)
 
-
-# ---------------------------------------------------------------------------
-# Utilities
-# ---------------------------------------------------------------------------
 
 def utc_now() -> str:
-    """Return a compact ISO-8601 UTC timestamp."""
     return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def load_config() -> Dict[str, Any]:
-    """Load ``supervisor_config.json``. Returns ``{}`` on missing/invalid."""
     cfg_path = REPO_ROOT / "supervisor_config.json"
     if not cfg_path.exists():
         return {}
     try:
         return json.loads(cfg_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        print(
-            f"[orchestrator] WARNING: supervisor_config.json is invalid: {exc}",
-            file=sys.stderr,
-        )
+    except json.JSONDecodeError:
         return {}
 
 
 def ensure_dirs() -> None:
-    """Create output directories the workflow needs to write into."""
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ---------------------------------------------------------------------------
-# Stage 1 — PREFLIGHT
-# ---------------------------------------------------------------------------
-
 def run_preflight() -> Dict[str, Any]:
-    """Shell out to ``scripts/preflight.py`` and parse its JSON output."""
     cmd = [sys.executable, str(SCRIPT_DIR / "preflight.py"), "--json"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
     except subprocess.TimeoutExpired:
-        return {"ready": False, "error": "preflight timed out after 60s"}
+        return {"ready": False, "error": "preflight timed out after 1800s"}
     try:
-        report = json.loads(proc.stdout)
+        payload = json.loads(proc.stdout)
     except json.JSONDecodeError:
-        report = {
+        return {
             "ready": False,
-            "raw_stdout": proc.stdout,
-            "raw_stderr": proc.stderr,
+            "error": "invalid_preflight_json",
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
         }
-    report["_exit_code"] = proc.returncode
+    payload["_exit_code"] = proc.returncode
+    return payload
+
+
+def run_unified_tests() -> Dict[str, Any]:
+    cmd = [sys.executable, str(SCRIPT_DIR / "run_tests.py")]
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except subprocess.TimeoutExpired:
+        return {"passed": False, "status": "timeout", "exit_code": 124}
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {
+            "passed": False,
+            "status": "invalid_json",
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+        }
+    payload["_runner_exit_code"] = proc.returncode
+    return payload
+
+
+def compute_write_scope(config: Dict[str, Any]) -> List[str]:
+    roots = config.get("allowed_write_roots") or ["scripts", "src", "tests", ".qoder", "docs"]
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for root in roots:
+        if root not in seen:
+            ordered.append(root)
+            seen.add(root)
+    return ordered
+
+
+def write_stage_tool_policy(config: Dict[str, Any]) -> Dict[str, Any]:
+    allowed_tools = config.get("qoder_write_allowed_tools")
+    if allowed_tools is None:
+        allowed_tools = ["Bash", "Edit"]
+    disallowed_tools = config.get("qoder_write_disallowed_tools") or []
+    return {
+        "allowed_tools": [str(item) for item in allowed_tools],
+        "disallowed_tools": [str(item) for item in disallowed_tools],
+        "try_without_yolo_first": bool(config.get("qoder_write_try_without_yolo_first", True)),
+        "no_yolo_timeout_seconds": int(config.get("qoder_write_no_yolo_timeout_seconds", 60)),
+        "yolo_enabled": bool(config.get("qoder_write_yolo", True)),
+        "yolo_fallback_on_permission_error": bool(
+            config.get("qoder_write_yolo_fallback_on_permission_error", True)
+        ),
+    }
+
+
+def needs_yolo_retry(result: Dict[str, Any]) -> bool:
+    if result.get("ok"):
+        return False
+    chunks: List[str] = []
+    for key in ("error", "stderr", "stdout", "text"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            chunks.append(value)
+    events = result.get("events")
+    if events:
+        try:
+            chunks.append(json.dumps(events, ensure_ascii=False))
+        except TypeError:
+            chunks.append(str(events))
+    haystack = "\n".join(chunks).lower()
+    return any(hint in haystack for hint in WRITE_PERMISSION_HINTS)
+
+
+def run_git(args: List[str]) -> Tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except FileNotFoundError:
+        return 127, "", "git not on PATH"
+    except subprocess.TimeoutExpired:
+        return 124, "", "git timed out after 60s"
+
+
+def git_branch_name() -> str:
+    code, out, _err = run_git(["rev-parse", "--abbrev-ref", "HEAD"])
+    return out.strip() if code == 0 and out.strip() else "unknown"
+
+
+def git_head_sha() -> str | None:
+    code, out, _err = run_git(["rev-parse", "HEAD"])
+    if code == 0 and out.strip():
+        return out.strip()
+    return None
+
+
+def _is_ignored(path: str, patterns: List[str]) -> bool:
+    if not patterns:
+        return False
+    parts = path.split("/")
+    for pat in patterns:
+        if fnmatch.fnmatch(path, pat):
+            return True
+        for part in parts:
+            if fnmatch.fnmatch(part, pat):
+                return True
+        if "/" in pat and path.startswith(pat.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def git_status_entries(ignore: List[str]) -> List[Dict[str, str]]:
+    code, out, _err = run_git(["status", "--porcelain"])
+    if code != 0:
+        return []
+    dirty: List[Dict[str, str]] = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        status = line[:2]
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        path = path.strip('"')
+        if _is_ignored(path, ignore):
+            continue
+        dirty.append({"status": status, "path": path})
+    return dirty
+
+
+def snapshot_repo(root: Path, ignore: List[str]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = str(Path(dirpath).relative_to(root)).replace(os.sep, "/")
+        if rel_dir == ".":
+            rel_dir = ""
+        kept: List[str] = []
+        for dirname in dirnames:
+            if dirname in ALWAYS_SKIP_DIRS:
+                continue
+            combined = (rel_dir + "/" + dirname).lstrip("/")
+            if _is_ignored(dirname, ignore) or _is_ignored(combined, ignore):
+                continue
+            kept.append(dirname)
+        dirnames[:] = kept
+        for filename in filenames:
+            combined = (rel_dir + "/" + filename).lstrip("/")
+            if _is_ignored(filename, ignore) or _is_ignored(combined, ignore):
+                continue
+            full = Path(dirpath) / filename
+            try:
+                with full.open("rb") as handle:
+                    result[combined] = hashlib.sha1(handle.read()).hexdigest()
+            except OSError:
+                continue
+    return result
+
+
+def capture_checkpoint(allowed: List[str], ignore: List[str]) -> Dict[str, Any]:
+    dirty = git_status_entries(ignore)
+    checkpoint = {
+        "schema_version": 2,
+        "created_at": utc_now(),
+        "branch": git_branch_name(),
+        "commit_sha": git_head_sha(),
+        "was_dirty": bool(dirty),
+        "dirty_entries": dirty,
+        "allowed_write_roots": allowed,
+        "ignore_paths": ignore,
+        "review_source": "git_status" if not dirty else "filesystem_snapshot",
+    }
+    CHECKPOINT_PATH.write_text(json.dumps(checkpoint, indent=2) + "\n", encoding="utf-8")
+    return checkpoint
+
+
+def _inside_any_root(path: str, roots: List[str]) -> bool:
+    for root in roots:
+        root = root.rstrip("/")
+        if path == root or path.startswith(root + "/"):
+            return True
+    return False
+
+
+def review_changes_from_snapshots(
+    before: Dict[str, str],
+    after: Dict[str, str],
+    allowed: List[str],
+) -> Dict[str, Any]:
+    added = sorted(set(after) - set(before))
+    removed = sorted(set(before) - set(after))
+    modified = sorted(path for path in (set(before) & set(after)) if before[path] != after[path])
+    changed = sorted({*added, *removed, *modified})
+    out_of_scope = [path for path in changed if not _inside_any_root(path, allowed)]
+    return {
+        "diff_source": "filesystem_snapshot",
+        "added": added,
+        "removed": removed,
+        "modified": modified,
+        "changed": changed,
+        "out_of_scope": out_of_scope,
+        "scope_respected": not out_of_scope,
+    }
+
+
+def review_changes_from_git_status(ignore: List[str], allowed: List[str]) -> Dict[str, Any]:
+    entries = git_status_entries(ignore)
+    added: List[str] = []
+    removed: List[str] = []
+    modified: List[str] = []
+    for entry in entries:
+        status = entry["status"]
+        path = entry["path"]
+        if status == "??":
+            added.append(path)
+        elif "D" in status:
+            removed.append(path)
+        else:
+            modified.append(path)
+    changed = sorted({*added, *removed, *modified})
+    out_of_scope = [path for path in changed if not _inside_any_root(path, allowed)]
+    return {
+        "diff_source": "git_status",
+        "git_status_entries": entries,
+        "added": sorted(added),
+        "removed": sorted(removed),
+        "modified": sorted(modified),
+        "changed": changed,
+        "out_of_scope": out_of_scope,
+        "scope_respected": not out_of_scope,
+    }
+
+
+def review_changes(
+    *,
+    before: Dict[str, str],
+    after: Dict[str, str],
+    checkpoint: Dict[str, Any],
+    ignore: List[str],
+    allowed: List[str],
+) -> Dict[str, Any]:
+    if checkpoint.get("review_source") == "git_status":
+        return review_changes_from_git_status(ignore, allowed)
+    report = review_changes_from_snapshots(before, after, allowed)
+    report["baseline_reason"] = "pre-write working tree was already dirty"
     return report
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 — PLAN
-# ---------------------------------------------------------------------------
+def git_diff_text(paths: List[str]) -> str:
+    if not paths:
+        return "(no changed files)"
+    code, out, err = run_git(["diff", "--", *paths])
+    if code == 0 and out.strip():
+        return out
+    if code == 0:
+        return "(git diff empty for changed files)"
+    return f"(git diff unavailable: {err.strip()})"
 
-# Rough textual markers that hint at multiple independent tasks.
+
+def write_task_card(task: Dict[str, Any], plan_mode: str) -> str:
+    path = TASKS_DIR / f"{task['id']}.md"
+    lines = [
+        f"# {task['title']}",
+        "",
+        f"- plan_mode: {plan_mode}",
+        f"- task_id: {task['id']}",
+        f"- generated_at: {utc_now()}",
+        "",
+        "## Description",
+        "",
+        task["description"],
+        "",
+        "## Acceptance Criteria",
+        "",
+    ]
+    for item in task.get("acceptance", []):
+        lines.append(f"- {item}")
+    lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path.relative_to(REPO_ROOT))
+
+
 MULTI_TASK_SIGNALS = (
     "\nand ",
     " then ",
@@ -134,419 +390,361 @@ MULTI_TASK_SIGNALS = (
     "2. ",
     "3. ",
 )
-
-# Numbered / bulleted enumeration at the start of a line.
-_ENUM_RE = re.compile(r"(?m)^\s*(?:\d+[\).]|[-*])\s+(.+)$")
+ENUM_RE = re.compile(r"(?m)^\s*(?:\d+[\).]|[-*])\s+(.+)$")
 
 
-def is_multi_task(request: str, threshold_chars: int) -> bool:
-    """Short terse requests collapse to a single task; long or enumerated
-    ones become multi-task. Explicit enumeration (two or more bullets /
-    numbered items) always wins."""
-    enum_lines = _ENUM_RE.findall(request)
-    if len(enum_lines) >= 2:
-        return True
+def should_default_single_task(request: str, threshold_chars: int) -> bool:
+    if len(ENUM_RE.findall(request)) >= 2:
+        return False
     low = request.lower()
-    hits = sum(1 for s in MULTI_TASK_SIGNALS if s in low)
+    hits = sum(1 for marker in MULTI_TASK_SIGNALS if marker in low)
     if len(request) < threshold_chars:
-        return hits >= 2
-    return hits >= 1
+        return hits < 2
+    return hits == 0
 
 
-def _split_into_segments(request: str) -> List[str]:
-    """Split a request into task segments. Prefers newline-based enumeration,
-    then inline numbered/bulleted lists, and finally falls back to sentence
-    boundaries."""
-    numbered = _ENUM_RE.findall(request)
-    if len(numbered) >= 2:
-        return [s.strip() for s in numbered]
-    # Inline enumeration like "1. foo. 2. bar. 3. baz." on a single line.
-    inline_parts = re.split(r"(?=(?:^|\s)\d+[\).]\s)", request.strip())
-    inline_parts = [
-        re.sub(r"^\s*\d+[\).]\s*", "", p).strip().rstrip(".") + "."
-        for p in inline_parts if re.sub(r"^\s*\d+[\).]\s*", "", p).strip()
-    ]
-    # Keep only segments that have real content (more than a trailing period).
-    inline_parts = [p for p in inline_parts if len(p) > 1]
-    if len(inline_parts) >= 2:
-        return inline_parts
-    sentences = re.split(r"(?<=[.!?])\s+", request.strip())
-    sentences = [s for s in sentences if s.strip()]
-    if len(sentences) >= 2:
-        return sentences
-    return [request.strip()]
-
-
-def build_plan(request: str, config: Dict[str, Any]) -> Dict[str, Any]:
-    """Produce a deterministic plan. No model calls; pure heuristics."""
+def normalize_plan(request: str, config: Dict[str, Any], parsed: Dict[str, Any]) -> Dict[str, Any]:
+    tasks = list(parsed.get("tasks") or [])
+    mode = str(parsed.get("mode") or ("multi_task" if len(tasks) > 1 else "single_task"))
     threshold = int(config.get("single_task_threshold_chars", 200))
-    multi = is_multi_task(request, threshold)
-    mode = "multi_task" if multi else "single_task"
 
-    if not multi:
-        tasks = [
+    normalized_tasks: List[Dict[str, Any]] = []
+    for idx, task in enumerate(tasks, start=1):
+        normalized_tasks.append(
+            {
+                "id": str(task.get("id") or f"task-{idx}"),
+                "title": str(task.get("title") or f"Task {idx}")[:80],
+                "description": str(task.get("description") or "").strip(),
+                "acceptance": [str(item) for item in (task.get("acceptance") or [])],
+            }
+        )
+
+    if not normalized_tasks:
+        normalized_tasks = [
             {
                 "id": "task-1",
-                "title": (request.strip().split("\n", 1)[0][:80] or "Single task"),
+                "title": request.strip().split("\n", 1)[0][:80] or "Task 1",
                 "description": request.strip(),
                 "acceptance": [
                     "Implementation satisfies the user's request.",
-                    "`python scripts/run_tests.py` passes (ok or ok_no_tests).",
-                    "No files are changed outside `allowed_write_roots`.",
+                    "`python scripts/run_tests.py` passes.",
                 ],
             }
         ]
-    else:
-        segments = _split_into_segments(request)
-        tasks = [
+        mode = "single_task"
+
+    if should_default_single_task(request, threshold) and len(normalized_tasks) > 1:
+        merged_acceptance: List[str] = []
+        for task in normalized_tasks:
+            for item in task.get("acceptance", []):
+                if item not in merged_acceptance:
+                    merged_acceptance.append(item)
+        normalized_tasks = [
             {
-                "id": f"task-{i + 1}",
-                "title": (seg.strip().split("\n", 1)[0][:80] or f"Task {i + 1}"),
-                "description": seg.strip(),
-                "acceptance": [
-                    "Segment-specific implementation is complete.",
-                    "Tests still pass after this segment.",
+                "id": "task-1",
+                "title": normalized_tasks[0]["title"],
+                "description": request.strip(),
+                "acceptance": merged_acceptance or [
+                    "Implementation satisfies the user's request.",
+                    "`python scripts/run_tests.py` passes.",
                 ],
             }
-            for i, seg in enumerate(segments)
         ]
+        mode = "single_task"
 
     return {
-        "mode": mode,
+        "mode": mode if len(normalized_tasks) > 1 else "single_task",
         "generated_at": utc_now(),
         "request": request,
-        "tasks": tasks,
+        "tasks": normalized_tasks,
     }
 
 
-# ---------------------------------------------------------------------------
-# Stage 3 — WRITE (scope + snapshot + implementation)
-# ---------------------------------------------------------------------------
+def build_plan_prompt(request: str, config: Dict[str, Any]) -> str:
+    threshold = int(config.get("single_task_threshold_chars", 200))
+    return f"""
+You are the planner for a Qoder-native self-supervisor workflow.
+Read the repository context as needed, but do not modify files.
 
-def compute_write_scope(config: Dict[str, Any]) -> List[str]:
-    """Resolve the allowed write-scope roots, de-duplicated in order."""
-    roots = config.get("allowed_write_roots") or [
-        "scripts", "src", "tests", "artifacts", ".qoder",
-    ]
-    seen: set = set()
-    out: List[str] = []
-    for r in roots:
-        if r not in seen:
-            seen.add(r)
-            out.append(r)
-    return out
+Return only valid JSON with this exact shape:
+{{
+  "mode": "single_task" | "multi_task",
+  "tasks": [
+    {{
+      "id": "task-1",
+      "title": "short title",
+      "description": "what to do",
+      "acceptance": ["criterion 1", "criterion 2"]
+    }}
+  ]
+}}
 
+Rules:
+- Default to exactly one task for small requests.
+- Only split into multiple tasks when the request clearly contains
+  independent sub-goals.
+- Keep titles short and concrete.
+- Acceptance criteria must mention the unified test entry
+  `python scripts/run_tests.py`.
+- Do not mention Codex or any non-Qoder executor.
+- Do not include Markdown fences or explanatory prose.
 
-def _is_ignored(path: str, patterns: List[str]) -> bool:
-    """Return True if ``path`` (repo-relative, forward-slash) is ignored.
+Small-task threshold: {threshold} characters.
 
-    Supports the same pattern syntax as ``preflight.py``: plain fnmatch
-    globs (``*.pyc``, ``__pycache__``) and multi-segment path prefixes
-    (``.qoder/state``) that apply to everything beneath them.
-    """
-    if not patterns:
-        return False
-    parts = path.split("/")
-    for pat in patterns:
-        if fnmatch.fnmatch(path, pat):
-            return True
-        for p in parts:
-            if fnmatch.fnmatch(p, pat):
-                return True
-        if "/" in pat and path.startswith(pat.rstrip("/") + "/"):
-            return True
-    return False
+User request:
+{request}
+""".strip()
 
 
-def snapshot_repo(root: Path, ignore: List[str]) -> Dict[str, str]:
-    """Compute ``{relative_path: sha1}`` for every file under ``root``
-    that is not ignored. Used to detect what the write stage changed."""
-    result: Dict[str, str] = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = str(Path(dirpath).relative_to(root)).replace(os.sep, "/")
-        if rel_dir == ".":
-            rel_dir = ""
-        # Prune ignored / always-skipped directories in-place so we don't
-        # descend into them.
-        kept: List[str] = []
-        for d in dirnames:
-            if d in ALWAYS_SKIP_DIRS:
-                continue
-            combined = (rel_dir + "/" + d).lstrip("/")
-            if _is_ignored(d, ignore) or _is_ignored(combined, ignore):
-                continue
-            kept.append(d)
-        dirnames[:] = kept
-        for fn in filenames:
-            combined = (rel_dir + "/" + fn).lstrip("/")
-            if _is_ignored(fn, ignore) or _is_ignored(combined, ignore):
-                continue
-            full = Path(dirpath) / fn
-            try:
-                with full.open("rb") as fh:
-                    result[combined] = hashlib.sha1(fh.read()).hexdigest()
-            except OSError:
-                # Unreadable files are treated as absent; skip silently.
-                continue
-    return result
+def build_write_prompt(task: Dict[str, Any], allowed: List[str], tool_policy: Dict[str, Any]) -> str:
+    return f"""
+You are the writer stage of a Qoder-native self-supervisor workflow.
+Make the requested code changes now.
+
+Hard constraints:
+- Only modify files inside these allowed roots: {json.dumps(allowed)}
+- Do not touch files outside that scope.
+- Your Qoder CLI tool policy allows these tools: {json.dumps(tool_policy.get("allowed_tools", []))}
+- Your Qoder CLI tool policy disallows these tools: {json.dumps(tool_policy.get("disallowed_tools", []))}
+- Use Bash only for local inspection or validation related to this task.
+- Use Edit only for in-scope file changes that are necessary for the task.
+- Keep the change as small as possible.
+- After finishing, return only JSON with this shape:
+  {{
+    "summary": "what changed",
+    "claimed_completed": true,
+    "touched_files": ["path/one", "path/two"]
+  }}
+- Do not wrap the JSON in Markdown fences.
+
+Current task:
+{json.dumps(task, ensure_ascii=False, indent=2)}
+""".strip()
 
 
-def detect_qoder(cli: str) -> Dict[str, Any]:
-    """Discover whether the qoder CLI is available and responsive."""
-    path = shutil.which(cli)
-    if not path:
-        return {"available": False, "reason": "not_on_path", "cli": cli}
-    for probe in (["--version"], ["-V"], ["--help"]):
-        try:
-            proc = subprocess.run(
-                [cli, *probe], capture_output=True, text=True, timeout=10
-            )
-        except (subprocess.TimeoutExpired, OSError) as exc:
-            return {
-                "available": False,
-                "reason": f"probe_failed: {exc}",
-                "cli": cli,
-                "path": path,
-            }
-        if proc.returncode == 0:
-            head_text = (proc.stdout or proc.stderr).strip().splitlines()
-            return {
-                "available": True,
-                "cli": cli,
-                "path": path,
-                "probe": probe[0],
-                "version_head": head_text[0][:200] if head_text else "",
-            }
-    # Executable present but doesn't respond to any common probe — still
-    # callable, just undiscoverable, so we mark it available but unknown.
-    return {"available": True, "cli": cli, "path": path, "version_head": "unknown (probes failed)"}
-
-
-def write_task_card(task: Dict[str, Any], plan_mode: str) -> Path:
-    """Write a human-readable markdown card describing a task."""
-    card = TASKS_DIR / f"{task['id']}.md"
-    lines = [
-        f"# {task['title']}",
-        "",
-        f"- plan_mode: {plan_mode}",
-        f"- task_id: {task['id']}",
-        f"- generated_at: {utc_now()}",
-        "",
-        "## Description",
-        "",
-        task["description"],
-        "",
-        "## Acceptance criteria",
-        "",
-    ]
-    for crit in task.get("acceptance", []):
-        lines.append(f"- {crit}")
-    lines.append("")
-    card.write_text("\n".join(lines), encoding="utf-8")
-    return card
-
-
-def invoke_qoder(task: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
-    """Invoke the real qoder CLI for a task.
-
-    The concrete argv is driven by ``qoder_exec_template`` in the config,
-    which is an argv list with placeholders: ``{prompt}``, ``{title}``,
-    ``{task_id}``, ``{card_path}``. If no template is configured we
-    intentionally do *not* guess the CLI's interface; we return an
-    advisory result instead.
-    """
-    cli = config.get("qoder_cli", "qoder")
-    template = config.get("qoder_exec_template")
-    if not template or not isinstance(template, list):
-        return {
-            "mode": "advisory",
-            "note": "no qoder_exec_template configured; qoder was not auto-invoked",
-            "card": str((TASKS_DIR / f"{task['id']}.md").relative_to(REPO_ROOT)),
-        }
-    cmd: List[str] = [cli]
-    for arg in template:
-        if arg == "{prompt}":
-            cmd.append(task["description"])
-        elif arg == "{title}":
-            cmd.append(task["title"])
-        elif arg == "{task_id}":
-            cmd.append(task["id"])
-        elif arg == "{card_path}":
-            cmd.append(str((TASKS_DIR / f"{task['id']}.md").relative_to(REPO_ROOT)))
-        else:
-            cmd.append(str(arg))
-    try:
-        proc = subprocess.run(
-            cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=1800
-        )
-        return {
-            "mode": "qoder_cli",
-            "command": cmd,
-            "exit_code": proc.returncode,
-            "stdout_tail": (proc.stdout or "")[-2000:],
-            "stderr_tail": (proc.stderr or "")[-2000:],
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "mode": "qoder_cli",
-            "command": cmd,
-            "exit_code": 124,
-            "note": "qoder invocation timed out after 1800s",
-        }
-    except OSError as exc:
-        return {
-            "mode": "qoder_cli",
-            "command": cmd,
-            "exit_code": 127,
-            "note": f"qoder invocation failed: {exc}",
-        }
-
-
-def fallback_write(task: Dict[str, Any], allowed: List[str]) -> Dict[str, Any]:
-    """Advisory fallback used when qoder can't be invoked safely.
-
-    Rather than fabricate code, record the pending task under
-    ``artifacts/`` so the user has a clear artifact of what needs doing.
-    """
-    scratch = ARTIFACTS / f"{task['id']}_scratch.md"
-    lines = [
-        f"# Pending implementation: {task['title']}",
-        "",
-        "The self-supervisor produced this task card because either the",
-        "qoder CLI was unavailable or no `qoder_exec_template` is",
-        "configured in `supervisor_config.json`. No source code was",
-        "modified automatically.",
-        "",
-        "## Task description",
-        "",
-        task["description"],
-        "",
-        "## How to complete",
-        "",
-        "1. Implement the change in your editor or via qoder.",
-        "2. Restrict edits to these allowed roots:",
-    ]
-    for r in allowed:
-        lines.append(f"   - `{r}`")
-    lines.append("")
-    lines.append("3. Re-run `python scripts/run_self_supervisor_qoder.py --request ...`")
-    lines.append("   (or `python scripts/verify_delivery.py` after manual edits).")
-    lines.append("")
-    scratch.write_text("\n".join(lines), encoding="utf-8")
-    return {
-        "mode": "fallback_advisory",
-        "artifact": str(scratch.relative_to(REPO_ROOT)),
-    }
-
-
-def perform_write(
+def build_review_prompt(
+    request: str,
     plan: Dict[str, Any],
-    config: Dict[str, Any],
-    qoder_info: Dict[str, Any],
-    dry_run: bool,
-) -> Dict[str, Any]:
-    """Run the write stage for every task in the plan."""
-    allowed = compute_write_scope(config)
-    use_qoder = bool(qoder_info.get("available") and config.get("qoder_exec_template"))
-    invocations: List[Dict[str, Any]] = []
-    cards: List[str] = []
-    for task in plan["tasks"]:
-        card = write_task_card(task, plan["mode"])
-        cards.append(str(card.relative_to(REPO_ROOT)))
-        if dry_run:
-            invocations.append({"task_id": task["id"], "mode": "dry_run"})
-        elif use_qoder:
-            invocations.append({"task_id": task["id"], **invoke_qoder(task, config)})
-        else:
-            invocations.append({"task_id": task["id"], **fallback_write(task, allowed)})
-    if dry_run:
-        impl_mode = "dry_run"
-    elif use_qoder:
-        impl_mode = "qoder_cli"
-    else:
-        impl_mode = "fallback_advisory"
-    return {
-        "implementation_mode": impl_mode,
-        "allowed_write_roots": allowed,
-        "task_cards": cards,
-        "invocations": invocations,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Stage 4 — TEST
-# ---------------------------------------------------------------------------
-
-def run_unified_tests() -> Dict[str, Any]:
-    """Call ``scripts/run_tests.py`` — the single source of test truth."""
-    cmd = [sys.executable, str(SCRIPT_DIR / "run_tests.py")]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-    except subprocess.TimeoutExpired:
-        return {"passed": False, "status": "timeout", "exit_code": 124}
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        payload = {
-            "passed": False,
-            "status": "error",
-            "raw_stdout": proc.stdout,
-            "raw_stderr": proc.stderr,
-        }
-    payload["_runner_exit_code"] = proc.returncode
-    return payload
-
-
-# ---------------------------------------------------------------------------
-# Stage 5 — REVIEW
-# ---------------------------------------------------------------------------
-
-def _inside_any_root(path: str, roots: List[str]) -> bool:
-    for r in roots:
-        r_norm = r.rstrip("/")
-        if path == r_norm or path.startswith(r_norm + "/"):
-            return True
-    return False
-
-
-def review_changes(
-    before: Dict[str, str], after: Dict[str, str], allowed: List[str]
-) -> Dict[str, Any]:
-    """Classify changes between two snapshots and check scope."""
-    added = sorted(set(after) - set(before))
-    removed = sorted(set(before) - set(after))
-    modified = sorted(p for p in (set(before) & set(after)) if before[p] != after[p])
-    changed = sorted({*added, *removed, *modified})
-    out_of_scope = [p for p in changed if not _inside_any_root(p, allowed)]
-    notes: List[str] = []
-    if not changed:
-        notes.append("No in-scope file changes detected (advisory-mode run is expected to look like this).")
-    if len(changed) > 25:
-        notes.append("Large changeset — consider splitting into smaller tasks.")
-    if removed:
-        notes.append(f"{len(removed)} file(s) deleted; confirm the removals are intentional.")
-    return {
-        "added": added,
-        "removed": removed,
-        "modified": modified,
-        "changed": changed,
-        "out_of_scope": out_of_scope,
-        "scope_respected": not out_of_scope,
-        "notes": notes,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Stage 6 — AUDIT (deterministic gates)
-# ---------------------------------------------------------------------------
-
-def audit(
-    tests: Dict[str, Any],
     review: Dict[str, Any],
+    tests: Dict[str, Any],
+    diff_text: str,
+) -> str:
+    payload = {
+        "request": request,
+        "plan_mode": plan.get("mode"),
+        "tasks": plan.get("tasks"),
+        "review_scope": {
+            "changed": review.get("changed"),
+            "out_of_scope": review.get("out_of_scope"),
+            "scope_respected": review.get("scope_respected"),
+        },
+        "tests": {
+            "status": tests.get("status"),
+            "passed": tests.get("passed"),
+            "exit_code": tests.get("exit_code"),
+        },
+    }
+    return f"""
+You are the reviewer stage of a Qoder-native self-supervisor workflow.
+Review the current result without modifying files.
+
+Return only valid JSON with this shape:
+{{
+  "decision": "approve" | "reject",
+  "summary": "short review summary",
+  "blocking_issues": ["issue 1"],
+  "non_blocking_suggestions": ["suggestion 1"]
+}}
+
+Reject if:
+- tests failed,
+- files changed outside scope,
+- the request is clearly incomplete.
+
+Evidence:
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+
+Git diff for changed files:
+{diff_text}
+""".strip()
+
+
+def run_plan_stage(request: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    result = invoke_qoder_json(
+        prompt=build_plan_prompt(request, config),
+        workspace=REPO_ROOT,
+        disallowed_tools=["Edit"],
+        max_turns=int(config.get("qoder_plan_max_turns", 12)),
+        timeout=int(config.get("qoder_timeout_seconds", 1800)),
+    )
+    if not result.get("ok"):
+        return {"ok": False, "invocation": result}
+    parsed = result.get("parsed")
+    if not isinstance(parsed, dict):
+        return {"ok": False, "invocation": result, "error": "planner_did_not_return_object"}
+    plan = normalize_plan(request, config, parsed)
+    PLAN_PATH.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    return {"ok": True, "plan": plan, "invocation": result}
+
+
+def run_write_stage(plan: Dict[str, Any], config: Dict[str, Any], allowed: List[str]) -> Dict[str, Any]:
+    tool_policy = write_stage_tool_policy(config)
+    invocations: List[Dict[str, Any]] = []
+    task_cards: List[str] = []
+    for task in plan.get("tasks", []):
+        task_cards.append(write_task_card(task, plan.get("mode", "single_task")))
+        attempts: List[Dict[str, Any]] = []
+
+        def run_attempt(*, yolo: bool, attempt_name: str) -> Dict[str, Any]:
+            timeout = (
+                int(tool_policy.get("no_yolo_timeout_seconds", 60))
+                if not yolo and tool_policy.get("try_without_yolo_first")
+                else int(config.get("qoder_timeout_seconds", 1800))
+            )
+            result = invoke_qoder_json(
+                prompt=build_write_prompt(task, allowed, tool_policy),
+                workspace=REPO_ROOT,
+                yolo=yolo,
+                allowed_tools=tool_policy.get("allowed_tools") or None,
+                disallowed_tools=tool_policy.get("disallowed_tools") or None,
+                max_turns=int(config.get("qoder_write_max_turns", 40)),
+                timeout=timeout,
+            )
+            attempt_record: Dict[str, Any] = {
+                "attempt": attempt_name,
+                "yolo": yolo,
+                "timeout_seconds": timeout,
+                "allowed_tools": tool_policy.get("allowed_tools", []),
+                "disallowed_tools": tool_policy.get("disallowed_tools", []),
+                "ok": bool(result.get("ok")),
+                "command": result.get("command"),
+                "exit_code": result.get("exit_code"),
+                "session_id": result.get("session_id"),
+                "text": result.get("text"),
+                "stderr": result.get("stderr"),
+            }
+            if result.get("ok"):
+                attempt_record["writer_result"] = result.get("parsed")
+            else:
+                attempt_record["error"] = result.get("error")
+            attempts.append(attempt_record)
+            return result
+
+        initial_yolo = (
+            False if tool_policy.get("try_without_yolo_first") else bool(tool_policy.get("yolo_enabled"))
+        )
+        initial_name = "restricted_no_yolo" if not initial_yolo else "restricted_yolo"
+        result = run_attempt(yolo=initial_yolo, attempt_name=initial_name)
+        used_yolo_fallback = False
+
+        if (
+            not result.get("ok")
+            and not initial_yolo
+            and tool_policy.get("yolo_enabled")
+            and tool_policy.get("yolo_fallback_on_permission_error")
+            and (result.get("error") == "timeout" or needs_yolo_retry(result))
+        ):
+            result = run_attempt(yolo=True, attempt_name="restricted_yolo_fallback")
+            used_yolo_fallback = True
+
+        record = {
+            "task_id": task["id"],
+            "tool_policy": tool_policy,
+            "attempts": attempts,
+            "used_yolo_fallback": used_yolo_fallback,
+            "ok": bool(result.get("ok")),
+            "command": result.get("command"),
+            "exit_code": result.get("exit_code"),
+            "session_id": result.get("session_id"),
+            "text": result.get("text"),
+            "stderr": result.get("stderr"),
+        }
+        if result.get("ok"):
+            record["writer_result"] = result.get("parsed")
+        else:
+            record["error"] = result.get("error")
+        invocations.append(record)
+
+    successful = [item for item in invocations if item.get("ok")]
+    failed = [item for item in invocations if not item.get("ok")]
+    successful_yolo = sum(
+        1 for item in successful for attempt in item.get("attempts", []) if attempt.get("ok") and attempt.get("yolo")
+    )
+    successful_non_yolo = sum(
+        1 for item in successful for attempt in item.get("attempts", []) if attempt.get("ok") and not attempt.get("yolo")
+    )
+    return {
+        "execution_mode": "qodercli_headless",
+        "executor": "qodercli",
+        "real_execution": bool(successful),
+        "allowed_write_roots": allowed,
+        "tool_policy": tool_policy,
+        "task_cards": task_cards,
+        "invocations": invocations,
+        "successful_invocations": len(successful),
+        "failed_invocations": len(failed),
+        "successful_non_yolo_invocations": successful_non_yolo,
+        "successful_yolo_invocations": successful_yolo,
+        "all_invocations_succeeded": not failed,
+    }
+
+
+def run_review_stage(
+    request: str,
     plan: Dict[str, Any],
+    review: Dict[str, Any],
+    tests: Dict[str, Any],
+    config: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Apply the hard gates. A delivery is accepted only when all pass."""
+    diff_text = git_diff_text(review.get("changed", []))
+    result = invoke_qoder_json(
+        prompt=build_review_prompt(request, plan, review, tests, diff_text),
+        workspace=REPO_ROOT,
+        disallowed_tools=["Edit"],
+        max_turns=int(config.get("qoder_review_max_turns", 16)),
+        timeout=int(config.get("qoder_timeout_seconds", 1800)),
+    )
+    if not result.get("ok"):
+        return {"ok": False, "invocation": result, "diff_text": diff_text}
+    parsed = result.get("parsed")
+    if not isinstance(parsed, dict):
+        return {
+            "ok": False,
+            "invocation": result,
+            "diff_text": diff_text,
+            "error": "reviewer_did_not_return_object",
+        }
+    return {
+        "ok": True,
+        "diff_text": diff_text,
+        "decision": parsed.get("decision"),
+        "summary": parsed.get("summary"),
+        "blocking_issues": list(parsed.get("blocking_issues") or []),
+        "non_blocking_suggestions": list(parsed.get("non_blocking_suggestions") or []),
+        "invocation": result,
+    }
+
+
+def audit(write: Dict[str, Any], tests: Dict[str, Any], review: Dict[str, Any], reviewer: Dict[str, Any]) -> Dict[str, Any]:
     checks = [
+        {
+            "name": "qoder_native_execution",
+            "passed": write.get("execution_mode") == "qodercli_headless",
+            "detail": write.get("execution_mode"),
+        },
+        {
+            "name": "restricted_tools_configured",
+            "passed": bool((write.get("tool_policy") or {}).get("allowed_tools")),
+            "detail": write.get("tool_policy"),
+        },
+        {
+            "name": "write_stage_succeeded",
+            "passed": bool(write.get("all_invocations_succeeded")),
+            "detail": {
+                "successful_invocations": write.get("successful_invocations"),
+                "failed_invocations": write.get("failed_invocations"),
+            },
+        },
         {
             "name": "tests_passed",
             "passed": bool(tests.get("passed")),
@@ -558,49 +756,45 @@ def audit(
             "detail": {"out_of_scope_count": len(review.get("out_of_scope", []))},
         },
         {
-            "name": "plan_has_tasks",
-            "passed": bool(plan.get("tasks")),
-            "detail": {"task_count": len(plan.get("tasks", []))},
+            "name": "changes_detected",
+            "passed": bool(review.get("changed")),
+            "detail": {"changed_count": len(review.get("changed", []))},
+        },
+        {
+            "name": "review_approved",
+            "passed": reviewer.get("decision") == "approve",
+            "detail": reviewer.get("decision"),
         },
     ]
-    return {"checks": checks, "all_passed": all(c["passed"] for c in checks)}
+    all_passed = all(check["passed"] for check in checks)
+    return {
+        "checks": checks,
+        "all_passed": all_passed,
+        "final_decision": "pass" if all_passed else "fail",
+    }
 
 
-# ---------------------------------------------------------------------------
-# Stage 7 — SEAL
-# ---------------------------------------------------------------------------
-
-def seal_delivery(payload: Dict[str, Any]) -> Path:
-    """Write the final delivery report atomically enough for our needs."""
-    DELIVERY_REPORT.write_text(
-        json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-    )
-    return DELIVERY_REPORT
-
-
-# ---------------------------------------------------------------------------
-# Report assembly
-# ---------------------------------------------------------------------------
-
-def _assemble(
+def assemble_report(
     *,
     request: str,
     config: Dict[str, Any],
-    plan: Optional[Dict[str, Any]],
-    write: Optional[Dict[str, Any]],
-    tests: Optional[Dict[str, Any]],
-    review: Optional[Dict[str, Any]],
-    audit_report: Optional[Dict[str, Any]],
-    stage_status: Dict[str, str],
-    delivery_status: str,
     preflight: Dict[str, Any],
-    qoder_info: Optional[Dict[str, Any]],
-    extras: Dict[str, Any],
+    plan: Dict[str, Any] | None,
+    write: Dict[str, Any] | None,
+    tests: Dict[str, Any] | None,
+    review: Dict[str, Any] | None,
+    reviewer: Dict[str, Any] | None,
+    audit_report: Dict[str, Any] | None,
+    checkpoint: Dict[str, Any] | None,
+    delivery_status: str,
+    stage_status: Dict[str, str],
+    total_duration_s: float,
 ) -> Dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": utc_now(),
         "repo_root": str(REPO_ROOT),
+        "executor": "qodercli",
         "user_request": request,
         "config_used": {
             "project_type": config.get("project_type"),
@@ -608,7 +802,15 @@ def _assemble(
             "allowed_write_roots": config.get("allowed_write_roots"),
             "allow_dirty_repo": config.get("allow_dirty_repo"),
             "qoder_cli": config.get("qoder_cli"),
-            "qoder_exec_template": config.get("qoder_exec_template"),
+            "qoder_headless_args": config.get("qoder_headless_args"),
+            "qoder_write_allowed_tools": config.get("qoder_write_allowed_tools"),
+            "qoder_write_disallowed_tools": config.get("qoder_write_disallowed_tools"),
+            "qoder_write_try_without_yolo_first": config.get("qoder_write_try_without_yolo_first"),
+            "qoder_write_no_yolo_timeout_seconds": config.get("qoder_write_no_yolo_timeout_seconds"),
+            "qoder_write_yolo": config.get("qoder_write_yolo"),
+            "qoder_write_yolo_fallback_on_permission_error": config.get(
+                "qoder_write_yolo_fallback_on_permission_error"
+            ),
         },
         "stages": {
             "preflight": preflight,
@@ -616,56 +818,41 @@ def _assemble(
             "write": write,
             "tests": tests,
             "review": review,
+            "reviewer": reviewer,
             "audit": audit_report,
         },
+        "checkpoint": checkpoint,
         "stage_status": stage_status,
-        "qoder_info": qoder_info,
         "delivery_status": delivery_status,
-        "next_step": "python scripts/verify_delivery.py",
-        **extras,
+        "next_step": "python scripts/verify_delivery.py --json --strict",
+        "total_duration_s": total_duration_s,
     }
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+def seal_delivery(report: Dict[str, Any]) -> None:
+    DELIVERY_REPORT.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+
 
 def main(argv: List[str]) -> int:
-    parser = argparse.ArgumentParser(
-        description="Run the Qoder self-supervisor orchestrator.",
-    )
-    parser.add_argument("--request", help="natural-language task request")
-    parser.add_argument(
-        "--request-file", help="read the request from a file instead of --request"
-    )
-    parser.add_argument(
-        "--force", action="store_true", help="proceed past non-ok preflight"
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="plan + write task cards, but skip any qoder or fallback writes",
-    )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="also emit the final report JSON to stdout",
-    )
+    parser = argparse.ArgumentParser(description="Run the Qoder-native self-supervisor.")
+    parser.add_argument("--request", default=None, help="natural-language request")
+    parser.add_argument("--request-file", default=None, help="read request text from a file")
+    parser.add_argument("--force", action="store_true", help="continue despite preflight blockers")
+    parser.add_argument("--json", action="store_true", help="also emit the final report JSON")
     args = parser.parse_args(argv)
 
     if not args.request and not args.request_file:
         print("error: provide --request or --request-file", file=sys.stderr)
         return 2
 
-    # Resolve request text
     if args.request_file:
         try:
             request = Path(args.request_file).read_text(encoding="utf-8").strip()
         except OSError as exc:
-            print(f"error: cannot read --request-file: {exc}", file=sys.stderr)
+            print(f"error: cannot read request file: {exc}", file=sys.stderr)
             return 2
     else:
-        request = args.request.strip()
+        request = str(args.request or "").strip()
 
     if not request:
         print("error: request is empty", file=sys.stderr)
@@ -673,102 +860,127 @@ def main(argv: List[str]) -> int:
 
     config = load_config()
     ensure_dirs()
-
-    stage_status: Dict[str, str] = {}
     started = time.monotonic()
+    stage_status: Dict[str, str] = {}
 
-    # 1. Preflight ---------------------------------------------------------
     preflight = run_preflight()
-    stage_status["preflight"] = (
-        "ok" if preflight.get("ready") else ("warn" if args.force else "blocked")
-    )
+    stage_status["preflight"] = "ok" if preflight.get("ready") else ("warn" if args.force else "blocked")
     if not preflight.get("ready") and not args.force:
-        payload = _assemble(
+        report = assemble_report(
             request=request,
             config=config,
+            preflight=preflight,
             plan=None,
             write=None,
             tests=None,
             review=None,
+            reviewer=None,
             audit_report=None,
-            stage_status=stage_status,
+            checkpoint=None,
             delivery_status="blocked_preflight",
-            preflight=preflight,
-            qoder_info=None,
-            extras={
-                "hint": (
-                    "run `python scripts/preflight.py --fix` or re-run with --force"
-                ),
-            },
+            stage_status=stage_status,
+            total_duration_s=round(time.monotonic() - started, 3),
         )
-        seal_delivery(payload)
+        seal_delivery(report)
         if args.json:
-            print(json.dumps(payload, indent=2))
+            print(json.dumps(report, indent=2))
         else:
             print(f"[orchestrator] blocked at preflight. Report: {DELIVERY_REPORT}")
         return 1
 
-    # 2. Plan --------------------------------------------------------------
-    plan = build_plan(request, config)
-    PLAN_PATH.write_text(json.dumps(plan, indent=2) + "\n", encoding="utf-8")
+    ignore = list(config.get("ignore_paths") or [])
+    allowed = compute_write_scope(config)
+    checkpoint = capture_checkpoint(allowed, ignore)
+
+    snapshot_before = (
+        snapshot_repo(REPO_ROOT, ignore)
+        if checkpoint.get("review_source") == "filesystem_snapshot"
+        else {}
+    )
+
+    plan_stage = run_plan_stage(request, config)
+    if not plan_stage.get("ok"):
+        stage_status["plan"] = "blocked"
+        report = assemble_report(
+            request=request,
+            config=config,
+            preflight=preflight,
+            plan={"error": plan_stage},
+            write=None,
+            tests=None,
+            review=None,
+            reviewer=None,
+            audit_report=None,
+            checkpoint=checkpoint,
+            delivery_status="blocked_plan",
+            stage_status=stage_status,
+            total_duration_s=round(time.monotonic() - started, 3),
+        )
+        seal_delivery(report)
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(f"[orchestrator] blocked at plan. Report: {DELIVERY_REPORT}")
+        return 1
+
+    plan = plan_stage["plan"]
     stage_status["plan"] = "ok"
 
-    # 3. Write (snapshot → implement → snapshot again) --------------------
-    ignore = list(config.get("ignore_paths") or [])
-    snapshot_before = snapshot_repo(REPO_ROOT, ignore)
-    qoder_info = detect_qoder(config.get("qoder_cli", "qoder"))
-    write = perform_write(plan, config, qoder_info, args.dry_run)
-    stage_status["write"] = "ok"
-    snapshot_after = snapshot_repo(REPO_ROOT, ignore)
+    write = run_write_stage(plan, config, allowed)
+    stage_status["write"] = "ok" if write.get("all_invocations_succeeded") else "blocked"
 
-    # 4. Test --------------------------------------------------------------
+    snapshot_after = (
+        snapshot_repo(REPO_ROOT, ignore)
+        if checkpoint.get("review_source") == "filesystem_snapshot"
+        else {}
+    )
+
     tests = run_unified_tests()
-    stage_status["test"] = "ok" if tests.get("passed") else "failed"
+    stage_status["tests"] = "ok" if tests.get("passed") else "blocked"
 
-    # 5. Review ------------------------------------------------------------
-    allowed = compute_write_scope(config)
-    review = review_changes(snapshot_before, snapshot_after, allowed)
-    stage_status["review"] = "ok" if review["scope_respected"] else "warn"
+    review = review_changes(
+        before=snapshot_before,
+        after=snapshot_after,
+        checkpoint=checkpoint,
+        ignore=ignore,
+        allowed=allowed,
+    )
+    stage_status["review"] = "ok" if review.get("scope_respected") else "blocked"
 
-    # 6. Audit -------------------------------------------------------------
-    audit_report = audit(tests, review, plan)
-    stage_status["audit"] = "ok" if audit_report["all_passed"] else "blocked"
+    reviewer = run_review_stage(request, plan, review, tests, config)
+    stage_status["reviewer"] = "ok" if reviewer.get("ok") else "blocked"
 
-    # 7. Seal --------------------------------------------------------------
-    if audit_report["all_passed"]:
-        advisory = write.get("implementation_mode") in ("fallback_advisory", "dry_run")
-        delivery_status = "sealed_advisory" if advisory else "sealed"
-    else:
-        delivery_status = "blocked_audit"
+    audit_report = audit(write, tests, review, reviewer if reviewer.get("ok") else {})
+    stage_status["audit"] = "ok" if audit_report.get("all_passed") else "blocked"
 
-    total_s = round(time.monotonic() - started, 3)
-
-    payload = _assemble(
+    delivery_status = "sealed" if audit_report.get("all_passed") else "blocked"
+    report = assemble_report(
         request=request,
         config=config,
+        preflight=preflight,
         plan=plan,
         write=write,
         tests=tests,
         review=review,
+        reviewer=reviewer,
         audit_report=audit_report,
-        stage_status=stage_status,
+        checkpoint=checkpoint,
         delivery_status=delivery_status,
-        preflight=preflight,
-        qoder_info=qoder_info,
-        extras={"total_duration_s": total_s},
+        stage_status=stage_status,
+        total_duration_s=round(time.monotonic() - started, 3),
     )
-    seal_delivery(payload)
+    seal_delivery(report)
 
     if args.json:
-        print(json.dumps(payload, indent=2))
+        print(json.dumps(report, indent=2))
     else:
         print(f"[orchestrator] delivery_status={delivery_status}")
-        print(f"[orchestrator] implementation_mode={write.get('implementation_mode')}")
+        print(f"[orchestrator] execution_mode={write.get('execution_mode')}")
         print(f"[orchestrator] report: {DELIVERY_REPORT}")
-        print(f"[orchestrator] next: python scripts/verify_delivery.py")
+        print("[orchestrator] next: python scripts/verify_delivery.py --json --strict")
 
-    return 0 if delivery_status in ("sealed", "sealed_advisory") else 1
+    return 0 if delivery_status == "sealed" else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))

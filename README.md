@@ -1,231 +1,388 @@
 # Qoder Self-Supervisor v1
 
-A self-supervised development workflow for Qoder CLI projects. Give it a
-task in natural language and it handles **plan → write → test → review →
-audit → seal**, producing a machine-verifiable delivery package so you
-can accept or reject the work with confidence.
+This repository implements a Qoder-native self-supervised workflow with
+three layers:
 
-## What you get
+1. a deterministic Qoder project command
+2. a reusable Qoder project skill
+3. Python orchestration scripts
 
-- `artifacts/delivery_report.json` — stage-by-stage structured evidence.
-- `artifacts/user_acceptance.md`   — human-readable acceptance checklist.
-- `.qoder/state/plan.json`         — the plan that was actually used.
-- `.qoder/state/tasks/*.md`        — one card per planned sub-task.
+The architecture is intentionally strict:
 
-## Layout
+- all model-driven subcalls use `qodercli`
+- planning uses `qodercli -w ... -p ... --output-format=json`
+- writing uses `qodercli -w ... -p ... --output-format=json`
+- review uses `qodercli -w ... -p ... --output-format=json`
+- all tests go through `python3 scripts/run_tests.py`
+- no non-Qoder executor is part of the delivery workflow
 
-```
+## Primary Entry Point
+
+The documented primary entry point is the Qoder project command:
+
+- [.qoder/commands/self-supervisor.md](/Users/robert/Desktop/qoder/.qoder/commands/self-supervisor.md)
+
+In a Qoder session opened at the repository root, use the project
+command `self-supervisor` and provide the natural-language task you want
+handled. The command is the deterministic entry point for real runs.
+
+## Secondary Entry Point
+
+The companion project skill is still available:
+
+- [.qoder/skills/self-supervisor-v1/SKILL.md](/Users/robert/Desktop/qoder/.qoder/skills/self-supervisor-v1/SKILL.md)
+
+Use the skill as reusable project knowledge. Prefer the project command
+when you want predictable, repeatable execution.
+
+## Repository Structure
+
+```text
 .
-├── README.md
-├── supervisor_config.json
-├── .gitignore
 ├── .qoder/
-│   └── skills/
-│       └── self-supervisor-v1/
-│           └── SKILL.md
+│   ├── commands/
+│   │   └── self-supervisor.md
+│   ├── skills/
+│   │   └── self-supervisor-v1/
+│   │       └── SKILL.md
+│   └── state/
 ├── artifacts/
 │   └── .gitkeep
 ├── scripts/
 │   ├── bootstrap_mac.sh
+│   ├── clean_state.py
 │   ├── preflight.py
-│   ├── run_tests.py
+│   ├── qoder_invoke.py
+│   ├── rollback.py
 │   ├── run_self_supervisor_qoder.py
+│   ├── run_tests.py
 │   └── verify_delivery.py
+├── supervisor_config.json
 └── tests/
-    └── test_smoke.py
 ```
 
-## 1. Install into a Qoder CLI project
-
-**Option A — drop in alongside an existing project (recommended).**
+## Bootstrap
 
 ```bash
-# From the destination project's root:
-cp -R /path/to/qoder-self-supervisor/. ./
 bash scripts/bootstrap_mac.sh
 ```
 
-If the destination already has a `.gitignore`, `supervisor_config.json`,
-or `scripts/` directory, review the incoming files first — the
-workflow's scripts live under `scripts/` and should not clash with
-existing names.
+Bootstrap will:
 
-**Option B — use this directory as the project root.**
+- initialize git if needed
+- create `.venv` if needed
+- ensure `pytest` is available
+- verify `qodercli` is callable
+- ensure required `.qoder/` and `artifacts/` directories exist
+- run `python3 scripts/preflight.py --fix`
 
-`scripts/bootstrap_mac.sh` will:
+## Preflight
 
-- initialise a git repo (on branch `main` when supported) if one is
-  missing,
-- create `.venv/` and install `pytest` into it,
-- ensure `artifacts/` and `.qoder/state/tasks/` exist,
-- run `preflight.py --fix` to normalise `.gitignore`.
-
-The only hard requirements are **Python 3.9+** and **bash**. The
-`qoder` CLI is optional — the workflow degrades to **advisory mode** if
-it isn't on `PATH` or no `qoder_exec_template` is configured.
-
-## 2. Use it as a global Qoder Skill
-
-The skill file at `.qoder/skills/self-supervisor-v1/SKILL.md` follows
-the standard Qoder Skill format (YAML frontmatter + body):
-
-```yaml
----
-name: self-supervisor-v1
-description: …
----
-```
-
-Two usage modes:
-
-- **Project-scoped** (default): the skill sits under the project's
-  `.qoder/skills/` and is auto-discovered by the local Qoder CLI.
-- **Global**: copy the skill into the user-level skills directory once:
-
-  ```bash
-  mkdir -p ~/.qoder/skills
-  cp -R .qoder/skills/self-supervisor-v1 ~/.qoder/skills/
-  ```
-
-  After that, any project that also contains the `scripts/` suite and a
-  `supervisor_config.json` can invoke the skill by name. The skill
-  expects to find `scripts/run_self_supervisor_qoder.py` relative to
-  the current working directory.
-
-## 3. Validate that the workflow is healthy
-
-Run preflight and the unified test runner:
+Run preflight directly when you want a deterministic readiness check:
 
 ```bash
-python scripts/preflight.py --fix     # first time
-python scripts/preflight.py           # subsequent runs
-python scripts/run_tests.py
+python3 scripts/preflight.py --json
+python3 scripts/preflight.py --fix --json
+```
+
+Preflight checks:
+
+- project root markers
+- git repo state
+- Python environment
+- `qodercli --help`
+- `qodercli --version`
+- `qodercli -w "$PWD" -p "say hello" --output-format=json`
+- unified test entry health
+- dirty repo state with temp/generated paths ignored
+
+Ignored temp/generated paths:
+
+- `__pycache__`
+- `*.pyc`
+- `.venv`
+- `artifacts`
+- `.qoder/state`
+
+## Unified Test Contract
+
+Every stage uses the same test entry point:
+
+```bash
+python3 scripts/run_tests.py
+```
+
+You can strengthen it in [supervisor_config.json](/Users/robert/Desktop/qoder/supervisor_config.json).
+
+Default:
+
+```json
+"test_command": "python -m pytest -q"
+```
+
+Extended example:
+
+```json
+"test_command": [
+  "bash",
+  "-lc",
+  "ruff check . && mypy . && python -m pytest -q"
+]
+```
+
+## Write-Stage Safety Model
+
+The write stage is intentionally layered rather than relying only on
+`--yolo`.
+
+Current safety model:
+
+1. The request is narrowed into one or more task cards under `.qoder/state/tasks/`
+2. The writer prompt is told to stay inside `allowed_write_roots`
+3. Qoder CLI tool access is explicitly restricted to the configured write-stage tools
+4. The writer tries a restricted run without `--yolo` first
+5. The no-yolo attempt is time-bounded so headless runs do not hang indefinitely
+6. If headless execution is blocked by a permission prompt or the bounded attempt times out, the workflow can retry with `--yolo`
+7. Unified tests run immediately after writing
+8. Scope review checks that changed files stayed inside the allowed roots
+9. Strict verify confirms the sealed run was truly Qoder-native
+
+Default write-stage tool policy:
+
+```json
+"qoder_write_allowed_tools": ["Bash", "Edit"],
+"qoder_write_disallowed_tools": [],
+"qoder_write_try_without_yolo_first": true,
+"qoder_write_no_yolo_timeout_seconds": 45,
+"qoder_write_yolo": true,
+"qoder_write_yolo_fallback_on_permission_error": true
+```
+
+Interpretation:
+
+- `Bash` is for local inspection and validation
+- `Edit` is for in-scope file changes
+- `--yolo` is available as a headless fallback, not the first and only safety boundary
+
+## Qoder Invocation Wrapper
+
+[scripts/qoder_invoke.py](/Users/robert/Desktop/qoder/scripts/qoder_invoke.py)
+is the reusable wrapper around `qodercli`.
+
+It provides:
+
+- safe capability probes
+- workspace selection
+- headless invocation
+- structured JSON event parsing
+- JSON payload extraction from assistant text
+- clear failure reporting when Qoder output is invalid
+
+Example:
+
+```bash
+python3 scripts/qoder_invoke.py --probe --workspace .
+python3 scripts/qoder_invoke.py --workspace . --prompt "say hello"
+```
+
+## Recommended First Run For A Clean Repo
+
+Use this when the repository is clean and you want the least surprising
+path:
+
+```bash
+git status --short
+bash scripts/bootstrap_mac.sh
+python3 scripts/clean_state.py
+python3 scripts/preflight.py --json
+python3 scripts/run_tests.py
+```
+
+Then, from Qoder in the repo root, invoke the project command
+`self-supervisor` with your task.
+
+After the run:
+
+```bash
+python3 scripts/verify_delivery.py --json --strict
+```
+
+## Recommended Rerun After Changes
+
+Use this when you want a fresh, predictable rerun while preserving the
+latest sealed report for reference:
+
+```bash
+python3 scripts/clean_state.py
+python3 scripts/preflight.py --json
+python3 scripts/run_tests.py
+```
+
+Then update `artifacts/current_request.md` or provide a new task through
+the project command and run the workflow again.
+
+Use a full reset only when you explicitly want to remove the previous
+sealed artifacts too:
+
+```bash
+python3 scripts/clean_state.py --all
+```
+
+## Script Entry Points
+
+The project command is the primary interface, but the scripts remain the
+deterministic automation layer.
+
+Direct script entry:
+
+```bash
+python3 scripts/run_self_supervisor_qoder.py --request "Add a hello helper"
+```
+
+File-based entry:
+
+```bash
+printf '%s\n' 'Add a hello helper' > artifacts/current_request.md
+python3 scripts/run_self_supervisor_qoder.py --request-file artifacts/current_request.md
+```
+
+Useful flags:
+
+- `--force` continues past preflight blockers such as `dirty_repo`
+- `--json` prints the full sealed delivery report
+
+## What The Orchestrator Does
+
+[scripts/run_self_supervisor_qoder.py](/Users/robert/Desktop/qoder/scripts/run_self_supervisor_qoder.py)
+performs:
+
+1. preflight
+2. plan via `qodercli`
+3. write via `qodercli`
+4. unified tests
+5. diff + scope review
+6. reviewer stage via `qodercli`
+7. deterministic audit
+8. seal into `artifacts/delivery_report.json`
+
+## Verifying And Sealing
+
+```bash
+python3 scripts/verify_delivery.py --json --strict
+```
+
+Verification checks:
+
+- `artifacts/delivery_report.json` exists
+- `artifacts/user_acceptance.md` exists
+- unified tests pass
+- changed files remain inside `allowed_write_roots`
+- execution was truly Qoder-native:
+  - `executor == "qodercli"`
+  - `execution_mode == "qodercli_headless"`
+  - `real_execution == true`
+
+Final states:
+
+- `ready_for_acceptance`
+- `ready_with_warnings`
+- `blocked`
+
+With `--strict`, warnings become blocking.
+
+## Human Review Outputs
+
+Machine-readable report:
+
+- [artifacts/delivery_report.json](/Users/robert/Desktop/qoder/artifacts/delivery_report.json)
+
+Human-readable acceptance checklist:
+
+- [artifacts/user_acceptance.md](/Users/robert/Desktop/qoder/artifacts/user_acceptance.md)
+
+The acceptance file is designed to answer:
+
+- what changed
+- what tests passed
+- which files to inspect
+- which commands to run manually
+- which risks still remain
+
+## Cleanup And Predictable Reruns
+
+[scripts/clean_state.py](/Users/robert/Desktop/qoder/scripts/clean_state.py)
+clears stale run state while preserving the latest delivery report and
+acceptance checklist by default.
+
+Default cleanup removes:
+
+- `.qoder/state/*`
+- `artifacts/current_request.md`
+- `artifacts/preflight_report.json`
+- `artifacts/task-*_scratch.md`
+
+Examples:
+
+```bash
+python3 scripts/clean_state.py
+python3 scripts/clean_state.py --dry-run --json
+python3 scripts/clean_state.py --all
+```
+
+When to use it:
+
+- before a rerun when you want fresh state and task cards
+- after an interrupted run that left stale `.qoder/state/` files behind
+- before demos when you want the new report to be obviously current
+
+## Minimal Realistic Demo Task
+
+This is a good small task for a real first demo:
+
+> Create `docs/reviewer_quickstart.md` with a short checklist for manual
+> acceptance: inspect changed files, rerun tests, rerun verify, and note
+> remaining risks.
+
+It is small, useful, and exercises the same planning/write/review/verify
+path as larger real project tasks.
+
+## Strict End-To-End Demo
+
+```bash
+bash scripts/bootstrap_mac.sh
+python3 scripts/clean_state.py --all
+python3 scripts/preflight.py --json
+python3 scripts/run_tests.py
+printf '%s\n' 'Create docs/reviewer_quickstart.md with a short manual acceptance checklist for this repository. Include: inspect changed files, run python3 scripts/run_tests.py, run python3 scripts/verify_delivery.py --json --strict, and review remaining risks.' > artifacts/current_request.md
+python3 scripts/run_self_supervisor_qoder.py --force --request-file artifacts/current_request.md
+python3 scripts/verify_delivery.py --json --strict
 ```
 
 Healthy signals:
 
-- preflight JSON has `"ready": true` with an empty `blocking` array.
-- `run_tests.py` prints JSON with `"status": "ok"` (tests pass) or
-  `"status": "ok_no_tests"` (no tests yet — also acceptable).
+- Qoder capability probes pass in preflight
+- the write stage reports restricted tools and a real Qoder invocation
+- `delivery_status` is `sealed`
+- strict verify returns `ready_for_acceptance`
 
-Common `blocking` reasons and the fix:
+## Rollback
 
-| Reason | Fix |
-|---|---|
-| `not_a_git_repo` | `bash scripts/bootstrap_mac.sh` |
-| `project_root_not_recognized` | create `supervisor_config.json` or init git |
-| `python_unavailable` | install Python 3.9+ |
-| `dirty_repo` | commit/stash, or set `"allow_dirty_repo": true` |
-
-`qoder_cli_not_callable` is a **warning**, not a blocker — the
-orchestrator runs in advisory mode when qoder is missing.
-
-## 4. Run a minimal demo
+If a write run goes badly, inspect the checkpoint in
+`.qoder/state/checkpoint.json` and use:
 
 ```bash
-python scripts/run_self_supervisor_qoder.py \
-  --request "Add a hello() helper that returns 'hello world'"
+python3 scripts/rollback.py --help
 ```
 
-Expected output:
+Rollback is intentionally explicit and separate from the normal run path.
 
-```
-[orchestrator] delivery_status=sealed  (or sealed_advisory)
-[orchestrator] implementation_mode=qoder_cli  (or fallback_advisory)
-[orchestrator] report: /path/to/artifacts/delivery_report.json
-[orchestrator] next: python scripts/verify_delivery.py
-```
+## Operational Caveat In This Environment
 
-Then verify:
+In the current Codex desktop environment, some headless `qodercli` calls
+may need escalation because Qoder writes log files under:
 
-```bash
-python scripts/verify_delivery.py --json
-```
+- `~/.qoder/logs`
 
-Expected terminal status: `ready_for_acceptance` (or
-`ready_with_warnings` when running in advisory mode).
-
-Useful flags:
-
-- `--request-file path.txt` — load the prompt from a file.
-- `--dry-run`               — write the plan and task cards only.
-- `--force`                 — proceed past non-ok preflight.
-- `--json`                  — emit the full delivery report on stdout.
-
-## 5. Inspecting the outputs
-
-### `artifacts/delivery_report.json`
-
-Structured JSON with a `stages` object that embeds every raw stage
-output. Fields you'll check first:
-
-- `delivery_status` — one of `sealed`, `sealed_advisory`,
-  `blocked_preflight`, `blocked_audit`.
-- `stages.tests` — full test JSON (exit code, status, truncated output).
-- `stages.review.changed` — every file the orchestrator modified.
-- `stages.audit.checks` — the deterministic pass/fail gates.
-- `stage_status` — a flat per-stage status map for quick triage.
-
-### `artifacts/user_acceptance.md`
-
-Human-readable checklist produced by `scripts/verify_delivery.py`.
-Tells you:
-
-- the request, plan, and files changed,
-- sealed-vs-rerun test comparison (drift detection),
-- whether the delivery ran in advisory mode,
-- the exact next steps to accept or reject the delivery.
-
-## Configuration (`supervisor_config.json`)
-
-| Field | Purpose |
-|---|---|
-| `project_type` | Informational tag (e.g. `"python"`). |
-| `test_command` | Overrides the default `python -m pytest -q`. String or argv list. |
-| `ignore_paths` | Glob/path patterns excluded from "dirty" detection and from the file-diff snapshot. |
-| `allow_dirty_repo` | If `true`, preflight does not block on uncommitted changes. |
-| `prefer_repo_venv` | If `true`, `run_tests.py` uses `.venv/bin/python` when it exists. |
-| `allowed_write_roots` | Scope gate enforced by review, audit, and verify. |
-| `qoder_cli` | Name of the qoder executable on `PATH` (default `"qoder"`). |
-| `qoder_exec_template` | Optional argv list with `{prompt}`, `{title}`, `{task_id}`, `{card_path}` placeholders. Set to `null` for advisory mode. |
-| `single_task_threshold_chars` | Requests shorter than this collapse to a single task unless they contain explicit enumeration. |
-
-Example `qoder_exec_template` to wire in once you know your qoder CLI's
-subcommand:
-
-```json
-"qoder_exec_template": ["run", "--auto", "--prompt", "{prompt}"]
-```
-
-## Mental model
-
-The supervisor is deliberately conservative:
-
-- **Deterministic audit.** Acceptance is not a model judgment — it is
-  a scope check plus a test-result check.
-- **Separated evidence.** Plan, diff, test log, and audit live in
-  distinct fields of the report so drift can be inspected.
-- **Idempotent stages.** Re-running is always safe; the orchestrator
-  snapshots before and after and reports diffs based on current state.
-- **Graceful degradation.** When qoder is missing, tasks become
-  advisory rather than silently no-oping.
-
-## Troubleshooting
-
-- **`blocked_preflight`** — inspect `stages.preflight.blocking`. Most
-  common cause is a missing git repo; run
-  `python scripts/preflight.py --fix`.
-- **`blocked_audit`** — inspect `stages.audit.checks`. One of the
-  deterministic gates failed. Look at `stages.tests` and
-  `stages.review` for specifics.
-- **Test status drift** (sealed vs rerun) — environment changed between
-  the sealed run and verification (e.g. a package installed or
-  removed). Re-bootstrap and re-run the orchestrator.
-- **Empty `stages.review.changed` in non-advisory mode** — your
-  `qoder_exec_template` ran but made no changes. Check
-  `stages.write.invocations[*].exit_code` and `stdout_tail` for the
-  real reason.
-
-## License
-
-Internal tooling. Adapt freely.
+This is an environment constraint of the host sandbox, not a fallback
+path in the repository. The workflow itself remains Qoder-native and
+does not substitute another executor when Qoder is unavailable.

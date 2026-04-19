@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bootstrap the Qoder self-supervisor on macOS (works on Linux too).
+# Bootstrap the Qoder-native self-supervisor on macOS (works on Linux too).
 #
 # Idempotent: re-running is safe. Does the minimum needed to make the
 # workflow runnable end-to-end on a fresh machine.
@@ -8,8 +8,9 @@
 #   1. git init (on branch 'main' when supported) if the dir is not a repo
 #   2. verify python3 is available and at least 3.9
 #   3. create .venv (if missing) and install pytest into it
-#   4. ensure artifacts/ and .qoder/state/tasks/ exist
-#   5. run preflight --fix to normalise .gitignore and re-check the env
+#   4. verify qodercli is available
+#   5. ensure artifacts/, .qoder/commands/, .qoder/skills/, and .qoder/state/tasks/ exist
+#   6. run preflight --fix to normalise .gitignore and re-check the env
 
 set -euo pipefail
 
@@ -55,15 +56,28 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-echo "[bootstrap] upgrading pip and installing pytest into .venv"
-python -m pip install --quiet --upgrade pip
-python -m pip install --quiet pytest
+echo "[bootstrap] checking pytest availability in .venv"
+if python -c 'import pytest' >/dev/null 2>&1; then
+  echo "[bootstrap] pytest already available in .venv"
+else
+  echo "[bootstrap] pytest missing in .venv; installing"
+  python -m pip install --quiet --upgrade pip
+  python -m pip install --quiet pytest
+fi
 
-# --- 4. Required directories ------------------------------------------------
-mkdir -p artifacts .qoder/state/tasks
+# --- 4. Qoder CLI -----------------------------------------------------------
+if ! command -v qodercli >/dev/null 2>&1; then
+  echo "[bootstrap][error] qodercli not found on PATH"
+  echo "[bootstrap][hint]  install qodercli and make sure it is callable"
+  exit 1
+fi
+echo "[bootstrap] qodercli version: $(qodercli --version | tail -n 1)"
+
+# --- 5. Required directories ------------------------------------------------
+mkdir -p artifacts .qoder/commands .qoder/skills/self-supervisor-v1 .qoder/state/tasks
 touch artifacts/.gitkeep
 
-# --- 5. Preflight --fix -----------------------------------------------------
+# --- 6. Preflight --fix -----------------------------------------------------
 echo "[bootstrap] running preflight --fix"
 python scripts/preflight.py --fix >/dev/null || true
 

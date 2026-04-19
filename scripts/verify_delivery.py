@@ -1,34 +1,12 @@
 #!/usr/bin/env python3
-"""Verify that a sealed delivery is ready for human acceptance.
-
-What this script does, in order:
-
-1. Confirm ``artifacts/delivery_report.json`` exists and parses.
-2. Re-run the unified test entry point (``scripts/run_tests.py``) and
-   compare the status to the sealed run to catch environmental drift.
-3. Re-check that every file recorded in the report's review stage is
-   inside ``allowed_write_roots``.
-4. Emit a human-readable ``artifacts/user_acceptance.md`` with the
-   exact next steps for accepting or rejecting the delivery.
-5. Return one of a small, well-defined set of statuses.
-
-CLI:
-
-    --json     emit a structured JSON summary on stdout
-    --strict   treat warnings as failures (non-zero exit)
-
-Exit codes:
-
-    0   ready_for_acceptance  (or ready_with_warnings unless --strict)
-    1   blocked (missing report, test regression, scope violation)
-    2   warn_strict (warnings + --strict)
-"""
+"""Verify that a Qoder-native delivery is ready for acceptance."""
 
 from __future__ import annotations
 
 import argparse
 import datetime as _dt
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +25,6 @@ def utc_now() -> str:
 
 
 def load_delivery_report() -> Dict[str, Any]:
-    """Read and parse the sealed delivery report. Returns ``{}`` on failure."""
     if not DELIVERY_REPORT.exists():
         return {}
     try:
@@ -57,10 +34,15 @@ def load_delivery_report() -> Dict[str, Any]:
 
 
 def rerun_tests() -> Dict[str, Any]:
-    """Re-run the unified tests. Output is the same JSON schema as run_tests.py."""
     cmd = [sys.executable, str(SCRIPT_DIR / "run_tests.py")]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+        proc = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
     except subprocess.TimeoutExpired:
         return {"passed": False, "status": "timeout", "exit_code": 124}
     try:
@@ -68,247 +50,275 @@ def rerun_tests() -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {
             "passed": False,
-            "status": "error",
-            "raw_stdout": proc.stdout,
-            "raw_stderr": proc.stderr,
+            "status": "invalid_json",
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
         }
 
 
 def _inside(path: str, roots: List[str]) -> bool:
-    for r in roots:
-        r_norm = r.rstrip("/")
-        if path == r_norm or path.startswith(r_norm + "/"):
+    for root in roots:
+        root = root.rstrip("/")
+        if path == root or path.startswith(root + "/"):
             return True
     return False
 
 
 def scope_ok(changed: List[str], allowed_roots: List[str]) -> bool:
-    """All changed files must live under at least one allowed root."""
     if not allowed_roots:
         return True
-    return all(_inside(p, allowed_roots) for p in changed)
+    return all(_inside(path, allowed_roots) for path in changed)
+
+
+def classify_final_status(issues: List[str], warnings: List[str], strict: bool) -> str:
+    if issues:
+        return "blocked"
+    if warnings and strict:
+        return "blocked"
+    if warnings:
+        return "ready_with_warnings"
+    return "ready_for_acceptance"
+
+
+def writer_summaries(report: Dict[str, Any]) -> List[str]:
+    write = (report.get("stages") or {}).get("write") or {}
+    summaries: List[str] = []
+    for invocation in write.get("invocations", []) or []:
+        result = invocation.get("writer_result") or {}
+        summary = result.get("summary")
+        if isinstance(summary, str) and summary.strip() and summary not in summaries:
+            summaries.append(summary.strip())
+    return summaries
+
+
+def manual_validation_commands(changed: List[str]) -> List[str]:
+    commands = [
+        "python3 scripts/run_tests.py",
+        "python3 scripts/verify_delivery.py --json --strict",
+        "git status --short",
+    ]
+    if changed:
+        quoted = " ".join(shlex.quote(path) for path in changed)
+        commands.append(f"git status --short -- {quoted}")
+        commands.append(f"git diff --stat -- {quoted}")
+    return commands
+
+
+def remaining_risks(report: Dict[str, Any], issues: List[str], warnings: List[str]) -> List[str]:
+    risks: List[str] = []
+    for issue in issues:
+        if issue not in risks:
+            risks.append(issue)
+    for warning in warnings:
+        if warning not in risks:
+            risks.append(warning)
+
+    checkpoint = report.get("checkpoint") or {}
+    if checkpoint.get("was_dirty"):
+        risks.append(
+            "This run started from a dirty worktree, so changed-file attribution relies on the recorded checkpoint."
+        )
+
+    reviewer = (report.get("stages") or {}).get("reviewer") or {}
+    for suggestion in reviewer.get("non_blocking_suggestions", []) or []:
+        if suggestion not in risks:
+            risks.append(suggestion)
+
+    if not risks:
+        risks.append("No known remaining risks beyond normal manual review.")
+    return risks
 
 
 def build_acceptance_md(
     report: Dict[str, Any],
     rerun: Dict[str, Any],
-    status: str,
+    final_status: str,
     issues: List[str],
     warnings: List[str],
 ) -> str:
-    """Assemble the human-readable acceptance checklist."""
-    plan = (report.get("stages", {}) or {}).get("plan") or {}
-    review = (report.get("stages", {}) or {}).get("review") or {}
-    tests_sealed = (report.get("stages", {}) or {}).get("tests") or {}
-    write = (report.get("stages", {}) or {}).get("write") or {}
+    plan = (report.get("stages") or {}).get("plan") or {}
+    review = (report.get("stages") or {}).get("review") or {}
+    tests = (report.get("stages") or {}).get("tests") or {}
+    reviewer = (report.get("stages") or {}).get("reviewer") or {}
+    audit = (report.get("stages") or {}).get("audit") or {}
+    changed = review.get("changed", []) or []
+    summaries = writer_summaries(report)
+    commands = manual_validation_commands(changed)
+    risks = remaining_risks(report, issues, warnings)
 
     lines: List[str] = []
-    lines.append("# User Acceptance — Self-Supervisor Delivery")
+    lines.append("# User Acceptance — Qoder Self-Supervisor Delivery")
     lines.append("")
     lines.append(f"- generated_at: {utc_now()}")
     lines.append(f"- delivery_status: {report.get('delivery_status', 'unknown')}")
-    lines.append(f"- verification_status: **{status}**")
+    lines.append(f"- verification_status: **{final_status}**")
     lines.append(f"- report: `artifacts/delivery_report.json`")
     lines.append("")
-
     lines.append("## Request")
     lines.append("")
-    req = (report.get("user_request") or "").strip().replace("\n", "\n> ")
-    lines.append("> " + (req or "(none)"))
+    request = (report.get("user_request") or "").strip().replace("\n", "\n> ")
+    lines.append("> " + (request or "(none)"))
     lines.append("")
-
-    lines.append("## Plan")
+    lines.append("## What Changed")
     lines.append("")
-    lines.append(f"- mode: {plan.get('mode', 'unknown')}")
-    lines.append("- tasks:")
-    for t in plan.get("tasks", []) or []:
-        lines.append(f"  - {t.get('id')}: {t.get('title')}")
-    if not plan.get("tasks"):
-        lines.append("  - (no tasks recorded)")
+    if summaries:
+        for summary in summaries:
+            lines.append(f"- {summary}")
+    else:
+        for task in plan.get("tasks", []) or []:
+            lines.append(f"- {task.get('title')}")
+    if not summaries and not plan.get("tasks"):
+        lines.append("- (no change summary recorded)")
     lines.append("")
-
-    lines.append("## Files changed")
+    lines.append("## Files To Inspect")
     lines.append("")
-    changed = review.get("changed", []) or []
     if changed:
-        for c in changed:
-            lines.append(f"- `{c}`")
+        for path in changed:
+            lines.append(f"- `{path}`")
     else:
-        lines.append("- (none — either a no-op run or advisory mode)")
+        lines.append("- (none)")
     lines.append("")
-
-    lines.append("## Test evidence")
+    lines.append("## Tests That Passed")
     lines.append("")
     lines.append(
-        f"- sealed run: `{tests_sealed.get('status', 'unknown')}` "
-        f"(exit {tests_sealed.get('exit_code', '?')})"
+        f"- sealed run: `{' '.join(tests.get('command', [])) or 'python3 scripts/run_tests.py'}` -> "
+        f"`{tests.get('status', 'unknown')}` (exit {tests.get('exit_code', '?')})"
     )
     lines.append(
-        f"- rerun    : `{rerun.get('status', 'unknown')}` "
-        f"(exit {rerun.get('exit_code', '?')})"
+        f"- rerun: `{' '.join(rerun.get('command', [])) or 'python3 scripts/run_tests.py'}` -> "
+        f"`{rerun.get('status', 'unknown')}` (exit {rerun.get('exit_code', '?')})"
     )
-    same = tests_sealed.get("status") == rerun.get("status")
-    lines.append(f"- consistency: {'identical' if same else 'DRIFT'}")
     lines.append("")
-
-    if write.get("implementation_mode") in ("fallback_advisory", "dry_run"):
-        lines.append("## Advisory mode notice")
-        lines.append("")
-        lines.append(
-            "The qoder CLI was unavailable or no `qoder_exec_template` was "
-            "configured, so the orchestrator did not modify source code. "
-            "It wrote task cards under `.qoder/state/tasks/` and scratch "
-            "notes under `artifacts/` describing the pending work."
-        )
-        lines.append("")
-
-    lines.append("## What to do next")
+    lines.append("## Review Decision")
     lines.append("")
-    if status == "ready_for_acceptance":
-        lines.append("1. Inspect the file list above for accuracy.")
-        lines.append("2. Open `artifacts/delivery_report.json` for the full stage-by-stage evidence.")
-        lines.append("3. If the outcome matches your request, commit and proceed.")
-        lines.append(
-            "4. If it does not, re-run "
-            "`python scripts/run_self_supervisor_qoder.py --request \"…\"` "
-            "with revised instructions."
-        )
-    elif status == "ready_with_warnings":
-        lines.append("Delivery is acceptable but has non-blocking warnings:")
-        for w in warnings:
-            lines.append(f"- {w}")
-        lines.append("")
-        lines.append("If the warnings are acceptable to you, proceed.")
-        lines.append("Otherwise, re-run the orchestrator with revised instructions.")
+    lines.append(f"- decision: `{reviewer.get('decision', 'unknown')}`")
+    if reviewer.get("summary"):
+        lines.append(f"- summary: {reviewer.get('summary')}")
+    for issue in reviewer.get("blocking_issues", []) or []:
+        lines.append(f"- blocking: {issue}")
+    for item in reviewer.get("non_blocking_suggestions", []) or []:
+        lines.append(f"- suggestion: {item}")
+    lines.append("")
+    lines.append("## Audit")
+    lines.append("")
+    lines.append(f"- final_decision: `{audit.get('final_decision', 'unknown')}`")
+    for check in audit.get("checks", []) or []:
+        lines.append(f"- {check.get('name')}: {'pass' if check.get('passed') else 'fail'}")
+    lines.append("")
+    lines.append("## Manual Validation Commands")
+    lines.append("")
+    for command in commands:
+        lines.append(f"- `{command}`")
+    lines.append("")
+    lines.append("## Remaining Risks")
+    lines.append("")
+    for risk in risks:
+        lines.append(f"- {risk}")
+    lines.append("")
+    lines.append("## Acceptance Decision")
+    lines.append("")
+    lines.append(f"- verification_status: `{final_status}`")
+    if final_status == "ready_for_acceptance":
+        lines.append("- Recommended next step: inspect the files above, run the manual validation commands, then accept if the result matches the request.")
+    elif final_status == "ready_with_warnings":
+        lines.append("- Warnings are present but non-blocking; inspect the risks section before accepting.")
     else:
-        lines.append("**Acceptance is not recommended yet.** Issues detected:")
-        for i in issues:
-            lines.append(f"- {i}")
-        for w in warnings:
-            lines.append(f"- (warning) {w}")
-        lines.append("")
-        lines.append(
-            "Resolve the issues, then re-run "
-            "`python scripts/run_self_supervisor_qoder.py` and re-verify."
-        )
+        lines.append("- Acceptance is blocked until the listed issues are resolved.")
     lines.append("")
     return "\n".join(lines)
 
 
 def main(argv: List[str]) -> int:
-    parser = argparse.ArgumentParser(
-        description="Verify a sealed self-supervisor delivery.",
-    )
-    parser.add_argument(
-        "--json", action="store_true", help="emit a JSON summary on stdout"
-    )
-    parser.add_argument(
-        "--strict",
-        action="store_true",
-        help="non-zero exit on any warning, not just blocking issues",
-    )
+    parser = argparse.ArgumentParser(description="Verify a sealed Qoder-native delivery.")
+    parser.add_argument("--json", action="store_true", help="emit JSON summary")
+    parser.add_argument("--strict", action="store_true", help="treat warnings as blocking")
     args = parser.parse_args(argv)
 
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
-
     issues: List[str] = []
     warnings: List[str] = []
 
     report = load_delivery_report()
     if not report:
-        issues.append(
-            "delivery_report.json is missing or unreadable — run "
-            "`scripts/run_self_supervisor_qoder.py` first."
-        )
+        issues.append("delivery_report.json is missing or unreadable")
 
     rerun = rerun_tests()
     if not rerun.get("passed"):
         issues.append(
-            f"test rerun failed (status={rerun.get('status')}, "
-            f"exit_code={rerun.get('exit_code')})"
+            f"unified test entry failed on rerun (status={rerun.get('status')}, exit_code={rerun.get('exit_code')})"
         )
 
-    # Scope check using the delivery report's recorded review output.
-    review = (report.get("stages", {}) or {}).get("review", {}) if report else {}
-    changed = review.get("changed", []) or []
-    allowed = None
+    allowed = []
+    changed: List[str] = []
     if report:
-        allowed = report.get("config_used", {}).get("allowed_write_roots")
-        if allowed is None:
-            allowed = (report.get("stages", {}) or {}).get("write", {}).get(
-                "allowed_write_roots", []
-            )
-    if changed and allowed and not scope_ok(changed, allowed):
-        issues.append(
-            "scope violation: some changed files are outside allowed_write_roots"
-        )
+        allowed = list((report.get("config_used") or {}).get("allowed_write_roots") or [])
+        changed = list((((report.get("stages") or {}).get("review") or {}).get("changed")) or [])
 
-    # Consistency between sealed tests and this re-run.
-    sealed_status = (
-        (report.get("stages", {}) or {}).get("tests", {}).get("status") if report else None
-    )
+    if changed and allowed and not scope_ok(changed, allowed):
+        issues.append("changed files are outside allowed_write_roots")
+
+    delivery_status = report.get("delivery_status", "unknown") if report else "missing"
+    if delivery_status != "sealed":
+        issues.append(f"delivery_status is '{delivery_status}', expected 'sealed'")
+
+    write = ((report.get("stages") or {}).get("write") or {}) if report else {}
+    if write.get("executor") != "qodercli":
+        issues.append("write stage was not qodercli-native")
+    if write.get("execution_mode") != "qodercli_headless":
+        issues.append(
+            f"execution_mode is '{write.get('execution_mode', 'unknown')}', expected 'qodercli_headless'"
+        )
+    if not write.get("real_execution"):
+        issues.append("write stage did not record a real execution")
+
+    sealed_status = (((report.get("stages") or {}).get("tests") or {}).get("status")) if report else None
     if sealed_status and rerun.get("status") and sealed_status != rerun.get("status"):
         warnings.append(
             f"test status drift: sealed='{sealed_status}' vs rerun='{rerun.get('status')}'"
         )
 
-    # Delivery status sanity.
-    delivery_status = report.get("delivery_status", "unknown") if report else "missing"
-    if delivery_status not in ("sealed", "sealed_advisory"):
-        warnings.append(
-            f"delivery_status is '{delivery_status}' (expected 'sealed' or 'sealed_advisory')"
-        )
-    elif delivery_status == "sealed_advisory":
-        warnings.append(
-            "delivery was sealed in advisory mode — no source code changes were applied automatically"
-        )
+    final_status = classify_final_status(issues, warnings, args.strict)
+    USER_ACCEPTANCE.write_text(
+        build_acceptance_md(report, rerun, final_status, issues, warnings),
+        encoding="utf-8",
+    )
 
-    # Classify final status
-    if issues:
-        status = "blocked"
-    elif warnings and args.strict:
-        status = "warn_strict"
-    elif warnings:
-        status = "ready_with_warnings"
-    else:
-        status = "ready_for_acceptance"
-
-    md = build_acceptance_md(report, rerun, status, issues, warnings)
-    USER_ACCEPTANCE.write_text(md, encoding="utf-8")
+    if not USER_ACCEPTANCE.exists():
+        issues.append("user_acceptance.md could not be written")
+        final_status = classify_final_status(issues, warnings, args.strict)
 
     summary = {
-        "schema_version": 1,
-        "status": status,
+        "schema_version": 2,
+        "final_status": final_status,
         "issues": issues,
         "warnings": warnings,
+        "remaining_risks": remaining_risks(report, issues, warnings),
+        "manual_validation_commands": manual_validation_commands(changed),
         "rerun_tests": rerun,
         "delivery_report_exists": bool(report),
+        "user_acceptance_exists": USER_ACCEPTANCE.exists(),
         "delivery_status": delivery_status,
+        "execution_mode": write.get("execution_mode"),
         "user_acceptance_md": str(USER_ACCEPTANCE.relative_to(REPO_ROOT)),
     }
 
     if args.json:
         print(json.dumps(summary, indent=2))
     else:
-        print(f"[verify] status: {status}")
+        print(f"[verify] final_status: {final_status}")
         print(f"[verify] user acceptance: {USER_ACCEPTANCE}")
         if issues:
             print("[verify] issues:")
-            for i in issues:
-                print(f"  - {i}")
+            for issue in issues:
+                print(f"  - {issue}")
         if warnings:
             print("[verify] warnings:")
-            for w in warnings:
-                print(f"  - {w}")
+            for warning in warnings:
+                print(f"  - {warning}")
 
-    if status == "ready_for_acceptance":
-        return 0
-    if status == "ready_with_warnings":
-        return 0
-    if status == "warn_strict":
-        return 2
-    return 1
+    return 0 if final_status in ("ready_for_acceptance", "ready_with_warnings") else 1
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    raise SystemExit(main(sys.argv[1:]))

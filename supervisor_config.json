@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "project_type": "python",
   "test_command": "python -m pytest -q",
   "ignore_paths": [
@@ -19,14 +19,33 @@
   "allow_dirty_repo": false,
   "prefer_repo_venv": true,
   "allowed_write_roots": [
+    ".qoder",
+    "docs",
     "scripts",
     "src",
-    "tests",
-    "artifacts",
-    ".qoder",
-    "docs"
+    "tests"
   ],
-  "qoder_cli": "qoder",
-  "qoder_exec_template": null,
+  "qoder_cli": "qodercli",
+  "qoder_headless_args": [
+    "-w",
+    "{workspace}",
+    "-p",
+    "{prompt}",
+    "--output-format=json",
+    "-q"
+  ],
+  "qoder_timeout_seconds": 1800,
+  "qoder_plan_max_turns": 12,
+  "qoder_write_max_turns": 40,
+  "qoder_review_max_turns": 16,
+  "qoder_write_allowed_tools": [
+    "Bash",
+    "Edit"
+  ],
+  "qoder_write_disallowed_tools": [],
+  "qoder_write_try_without_yolo_first": true,
+  "qoder_write_no_yolo_timeout_seconds": 45,
+  "qoder_write_yolo": true,
+  "qoder_write_yolo_fallback_on_permission_error": true,
   "single_task_threshold_chars": 200
 }

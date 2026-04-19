@@ -154,11 +154,22 @@ def is_multi_task(request: str, threshold_chars: int) -> bool:
 
 
 def _split_into_segments(request: str) -> List[str]:
-    """Split a request into task segments. Prefers enumeration; falls back
-    to sentence boundaries."""
+    """Split a request into task segments. Prefers newline-based enumeration,
+    then inline numbered/bulleted lists, and finally falls back to sentence
+    boundaries."""
     numbered = _ENUM_RE.findall(request)
     if len(numbered) >= 2:
         return [s.strip() for s in numbered]
+    # Inline enumeration like "1. foo. 2. bar. 3. baz." on a single line.
+    inline_parts = re.split(r"(?=(?:^|\s)\d+[\).]\s)", request.strip())
+    inline_parts = [
+        re.sub(r"^\s*\d+[\).]\s*", "", p).strip().rstrip(".") + "."
+        for p in inline_parts if re.sub(r"^\s*\d+[\).]\s*", "", p).strip()
+    ]
+    # Keep only segments that have real content (more than a trailing period).
+    inline_parts = [p for p in inline_parts if len(p) > 1]
+    if len(inline_parts) >= 2:
+        return inline_parts
     sentences = re.split(r"(?<=[.!?])\s+", request.strip())
     sentences = [s for s in sentences if s.strip()]
     if len(sentences) >= 2:
